@@ -28,7 +28,7 @@ Claude Code  ──MCP──▶  antigravity-delegate  ──subprocess──▶
 - [Usage](#usage)
 - [Tool reference](#tool-reference)
 - [Permissions and safety](#permissions-and-safety)
-- [Cost](#cost)
+- [Reducing Claude Code token burn](#reducing-claude-code-token-burn)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -245,20 +245,76 @@ including across different projects.
 
 ---
 
-## Cost
+## Reducing Claude Code token burn
 
-Runs bill against your Antigravity account, and agentic loops are token-hungry —
-context is resent every turn. Measured:
+This is the main reason to use this server. Claude Code's context is a scarce,
+metered resource; your Antigravity subscription is a flat-rate one you have
+already paid for. Delegation **moves work from the scarce budget to the
+flat-rate one**.
+
+The saving on Claude's side is real and large, because delegating replaces the
+two things that consume context fastest:
+
+| Doing it in Claude Code | Delegating |
+| --- | --- |
+| Read every relevant file into context | Write one task description |
+| Emit every line of code as output tokens | Read one summary back |
+| Re-read files and iterate on errors | (happens inside Antigravity) |
+
+Claude keeps the work that actually needs its context — architecture, the
+existing codebase's logic, reviewing what comes back. Antigravity absorbs the
+token-heavy legwork.
+
+### Measured: a real UI feature
+
+Building a responsive pricing section (3 tier cards, CSS Grid, dark mode,
+accessible monthly/yearly toggle with live price updates) into a bare static
+site — 18.9 KB of HTML/CSS/JS across three files, verified working in a real
+browser:
+
+| | Claude Code tokens | Antigravity tokens |
+| --- | --- | --- |
+| **Delegated** (4 calls: prompts + results) | **~2,800** | 412,842 |
+| **Written by Claude directly** (estimated) | ~15,000–25,000 | 0 |
+| **Effect** | **~5–9× less Claude context** | paid by your subscription |
+
+The Claude-side figure is exact: 5,979 characters of task descriptions sent and
+5,275 characters of results read. The "written directly" figure is an estimate —
+4,729 output tokens for the code itself, plus reading the files, plus the
+reasoning and iteration a UI task normally takes.
+
+### The honest catch
+
+Those 412K Antigravity tokens bought 18.9 KB of code, and **only ~54% of that
+spend produced anything**:
+
+| Run | Tokens | Outcome |
+| --- | --- | --- |
+| Default mode (`allow_shell=false`) | 39,887 | ❌ `CANCELED` — needed a shell, auto-denied, zero output |
+| `allow_shell=true`, whole task at once | 97,837 | ❌ Timed out at 500s — wrote `index.html` only, left the site broken |
+| Resumed via `conversation_id`, `styles.css` only | 148,443 | ✅ Succeeded in 54s |
+| Fresh conversation, `app.js` only | 126,675 | ✅ Succeeded in 72s |
+
+Two lessons, both learned the expensive way:
+
+1. **Decompose UI tasks by file.** The whole feature at once timed out; one file
+   per call succeeded in about a minute each.
+2. **Resuming carries the failure's cost.** Run 3 resumed the timed-out
+   conversation and inherited its history — 148K tokens for one CSS file. The
+   fresh run in step 4 did comparable work for less. Start fresh unless you
+   genuinely need the prior context.
+
+### Per-task reference
 
 | Task | Tokens |
 | --- | --- |
 | Write a one-line file | ~25K |
 | Add type hints + docstrings to 2 small functions | ~49K |
 | Fix 3 bugs in a 20-line module | ~208K |
+| One file of a UI feature (scoped well) | ~127K |
 | A run that timed out without finishing | ~220K |
 
-This **moves** cost from Claude Code to a subscription you already pay for — it
-doesn't eliminate it. Keep `timeout_seconds` tight so failures fail fast.
+Keep `timeout_seconds` tight so failures fail fast and cheap.
 
 ### About `conversation_id`
 
