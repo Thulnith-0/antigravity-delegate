@@ -291,6 +291,11 @@ async def test_both_tools_registered_with_expected_schema() -> None:
         assert schema["properties"]["read_only"]["default"] is False
         assert (tool.description or "").strip()
 
+    # Conversation resumption is CLI-only: the SDK tool's equivalent is
+    # unverifiable without credentials, so it is deliberately not exposed.
+    cli_schema = by_name["delegate_to_antigravity_cli"].inputSchema
+    assert "conversation_id" in cli_schema["properties"]
+
 
 async def _call_expecting_error(
     arguments: dict, tool_name: str = "delegate_to_antigravity"
@@ -429,6 +434,27 @@ def test_build_cli_args_allow_shell_skips_permissions(workspace: Path) -> None:
     assert "--dangerously-skip-permissions" in args
 
 
+def test_build_cli_args_omits_conversation_by_default(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "x", workspace,
+        allow_shell=False, read_only=False, timeout_seconds=60, model=None,
+    )
+    assert "--conversation" not in args
+
+
+def test_build_cli_args_passes_conversation_id(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "x", workspace,
+        allow_shell=False, read_only=False, timeout_seconds=60, model=None,
+        conversation_id="abc-123",
+    )
+    i = args.index("--conversation")
+    assert args[i + 1] == "abc-123"
+    # agy's --continue ("most recent") is deliberately not used: it would be
+    # racy when delegations run concurrently.
+    assert "--continue" not in args
+
+
 def test_build_cli_args_model_override(workspace: Path) -> None:
     args = srv._build_cli_args(
         "x", workspace,
@@ -452,6 +478,39 @@ async def test_cli_delegation_success(
     assert "fake response for argv=" in text
     assert "Tokens: 49" in text
     assert "Warning" not in text
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_reports_conversation_id_for_chaining(
+    workspace: Path, fake_agy
+) -> None:
+    async with Client(srv.mcp) as client:
+        result = await client.call_tool(
+            "delegate_to_antigravity_cli",
+            {"task": "do a thing", "directory": str(workspace)},
+        )
+    text = "".join(getattr(b, "text", "") for b in result.content)
+    assert "conversation_id: `fake-conv-id`" in text
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_forwards_conversation_id_to_agy(
+    workspace: Path, fake_agy
+) -> None:
+    # The fake echoes its argv into the response, so this proves the flag
+    # actually reaches the subprocess rather than only being built.
+    async with Client(srv.mcp) as client:
+        result = await client.call_tool(
+            "delegate_to_antigravity_cli",
+            {
+                "task": "follow up",
+                "directory": str(workspace),
+                "conversation_id": "resume-me-42",
+            },
+        )
+    text = "".join(getattr(b, "text", "") for b in result.content)
+    assert "--conversation" in text
+    assert "resume-me-42" in text
 
 
 @pytest.mark.asyncio

@@ -102,6 +102,9 @@ Both take the same core arguments:
 | `timeout_seconds` | `900` | Abort the run after this many seconds (max 3600). |
 | `model` | backend default | Optional model override. |
 
+`delegate_to_antigravity_cli` additionally takes `conversation_id`, to resume a
+previous run's context. Every result reports the `conversation_id` to chain from.
+
 Both return the sub-agent's final answer followed by a footer (elapsed time,
 token usage, and backend-specific diagnostics), and both surface an early-stop
 or non-success status as a warning at the *top* of the reply, so a partial
@@ -201,6 +204,43 @@ Delegated runs are not cheap, and they bill against whichever account the tool
 uses. Observed: ~25K tokens for a one-line file write, ~208K for the small
 refactor above, and ~220K for a single run that timed out without finishing.
 Budget accordingly, and prefer `timeout_seconds` low enough to fail fast.
+
+### Resuming conversations (`conversation_id`)
+
+Verified working end to end: a resumed run recalls the earlier run's context,
+and every result reports its `conversation_id` so you can chain follow-ups.
+
+**Resuming is for continuity, not for saving tokens.** The cost effect is
+task-dependent and can go either way:
+
+| Follow-up task | Resumed | Fresh | Effect |
+| --- | --- | --- | --- |
+| Answer a question about a file already read | 36.8K | 30.2K | **+22% worse** -- carried history costs more than re-reading |
+| Recall a fact with nothing on disk to re-derive it from | 20.8K | 167.6K | **-88% better** -- the fresh run burned 127s hunting for the answer |
+
+Use it when restating context would be long or error-prone (conventions,
+decisions, a running refactor). Omit it for independent tasks, where a fresh
+conversation is usually cheaper.
+
+### Stored transcripts and cross-delegation leakage
+
+`agy` writes every conversation to `~/.gemini/antigravity-cli/` in plaintext --
+full transcripts under `brain/<conversation-id>/` and a `conversations/*.db`.
+These persist indefinitely and are not cleaned up by this server.
+
+**With `allow_shell=true`, a delegated agent can and will read them.** Verified:
+a fresh delegation, asked about a fact it had no legitimate access to, spent 58
+steps searching the filesystem, found a *previous, unrelated* delegation's
+transcript, and answered from it -- including a fact from a different test run
+entirely.
+
+The same probe with `allow_shell=false` correctly answered "UNKNOWN", because
+out-of-workspace reads are auto-denied.
+
+So with `allow_shell=true` there is no isolation between delegations: anything
+sent to one delegation may surface in a later, unrelated one, including across
+different projects. If you delegate anything sensitive, either keep
+`allow_shell=false` or clear `~/.gemini/antigravity-cli/brain/` between runs.
 
 ## Tests
 

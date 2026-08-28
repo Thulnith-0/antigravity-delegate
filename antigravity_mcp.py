@@ -417,6 +417,7 @@ def _build_cli_args(
     read_only: bool,
     timeout_seconds: int,
     model: str | None,
+    conversation_id: str | None = None,
 ) -> list[str]:
     args = [
         "-p",
@@ -431,6 +432,10 @@ def _build_cli_args(
         # keyboard; it should never be reinterpreted as a slash command.
         "--disable-slash-commands",
     ]
+    if conversation_id:
+        # Explicit id rather than agy's --continue ("most recent"), which would
+        # be racy when delegations run concurrently.
+        args += ["--conversation", conversation_id]
     if read_only:
         args += ["--mode", "plan"]
     if allow_shell:
@@ -453,6 +458,7 @@ class CliDelegationResult:
     usage: dict | None = None
     raw_stderr: str = ""
     parse_error: str | None = None
+    conversation_id: str | None = None
 
 
 async def _run_cli_delegation(
@@ -463,6 +469,7 @@ async def _run_cli_delegation(
     read_only: bool,
     timeout_seconds: int,
     model: str | None,
+    conversation_id: str | None = None,
 ) -> CliDelegationResult:
     binary = _find_cli_binary()
     command = _cli_command_prefix(binary) + _build_cli_args(
@@ -472,6 +479,7 @@ async def _run_cli_delegation(
         read_only=read_only,
         timeout_seconds=timeout_seconds,
         model=model,
+        conversation_id=conversation_id,
     )
 
     started = time.monotonic()
@@ -529,6 +537,7 @@ async def _run_cli_delegation(
         status=payload.get("status"),
         usage=payload.get("usage"),
         raw_stderr=stderr,
+        conversation_id=payload.get("conversation_id"),
     )
 
 
@@ -545,6 +554,11 @@ def _format_cli_result(result: CliDelegationResult, workspace: Path) -> str:
         total = result.usage.get("total_tokens")
         if total:
             lines.append(f"_Tokens: {total:,}_")
+
+    if result.conversation_id:
+        # Surfaced so a follow-up call can pass conversation_id and keep this
+        # session's context. Note resuming costs MORE tokens, not fewer.
+        lines.append(f"_conversation_id: `{result.conversation_id}`_")
 
     if result.parse_error:
         lines.append(
@@ -682,6 +696,7 @@ async def delegate_to_antigravity_cli(
     read_only: bool = False,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     model: str | None = DEFAULT_MODEL,
+    conversation_id: str | None = None,
 ) -> str:
     """Delegate a task to Antigravity via the `agy` CLI, using your logged-in account instead of a separate API key.
 
@@ -720,9 +735,17 @@ async def delegate_to_antigravity_cli(
             Passed through to agy's own `--print-timeout`.
         model: Optional model override (see `agy models` for valid IDs;
             includes non-Gemini models depending on your account).
+        conversation_id: Resume a previous run's conversation, keeping its
+            context (prior instructions, conventions, decisions) so you need
+            not restate them. Pass the `conversation_id` reported in an earlier
+            result. Use this for CONTINUITY, not to save tokens -- measured, a
+            resumed follow-up cost ~22% MORE than the same task in a fresh
+            conversation, because the carried history outweighs what re-reading
+            the files would have cost. Omit it for independent tasks.
 
     Returns:
-        agy's final answer, followed by token usage and any diagnostics.
+        agy's final answer, then token usage, the conversation_id for chaining,
+        and any diagnostics.
     """
     if not task or not task.strip():
         raise ToolError(
@@ -753,6 +776,7 @@ async def delegate_to_antigravity_cli(
             read_only=read_only,
             timeout_seconds=timeout,
             model=model,
+            conversation_id=conversation_id,
         )
     except ToolError:
         raise
