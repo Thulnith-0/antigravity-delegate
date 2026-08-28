@@ -243,6 +243,47 @@ including across different projects.
    account access to. Not your home directory, not repos holding credentials.
 4. Clear `~/.gemini/antigravity-cli/brain/` between sensitive runs.
 
+### When is `allow_shell` actually needed?
+
+Not always — it correlates with task size more than task type. Measured:
+
+| Task | `allow_shell=false` |
+| --- | --- |
+| Create a single file | ✅ Succeeded |
+| Add type hints + docstrings across 2 functions | ✅ Succeeded |
+| Read-only research question | ✅ Succeeded |
+| Fix 3 bugs across a module | ❌ `CANCELED` |
+| Build a whole UI feature in one call | ❌ `CANCELED` |
+
+Larger, multi-step tasks tend to reach for a command (to verify their own work),
+and that single denial cancels the entire run. **Decomposing a big task into
+per-file calls often keeps it inside the safe mode** as well as making it faster.
+
+### Changing the default
+
+If your workflow genuinely needs shell most of the time, set it once for your
+own machine rather than passing the flag on every call:
+
+```json
+{
+  "mcpServers": {
+    "antigravity-delegate": {
+      "command": "…/.venv/bin/python",
+      "args": ["…/antigravity_delegate.py"],
+      "env": { "ANTIGRAVITY_ALLOW_SHELL": "true" }
+    }
+  }
+}
+```
+
+The server logs a warning at startup when this is on. Individual calls still
+override it — `allow_shell=false` opts back out, and `read_only=true` continues
+to work normally rather than conflicting with the default.
+
+The shipped default stays `false` deliberately: this flag grants
+filesystem-wide access, and nobody should acquire that by installing a tool
+without reading this section.
+
 ---
 
 ## Reducing Claude Code token burn
@@ -336,6 +377,7 @@ Optional environment variables, set in the server's `env` block:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `ANTIGRAVITY_ALLOW_SHELL` | `false` | Default for `allow_shell`. **Read [Permissions and safety](#permissions-and-safety) before enabling.** |
 | `ANTIGRAVITY_TIMEOUT_SECONDS` | `900` | Default run timeout. |
 | `ANTIGRAVITY_MODEL` | — | Default model for every run. |
 | `ANTIGRAVITY_LOG_LEVEL` | `INFO` | Server log verbosity (stderr only). |

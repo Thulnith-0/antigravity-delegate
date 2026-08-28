@@ -51,9 +51,24 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Reads a boolean from the environment; anything unrecognised is a no."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 DEFAULT_TIMEOUT_SECONDS = _env_int("ANTIGRAVITY_TIMEOUT_SECONDS", 900)
 MAX_TIMEOUT_SECONDS = 3600
 DEFAULT_MODEL = os.environ.get("ANTIGRAVITY_MODEL") or None
+
+# Opt-in default for allow_shell. Ships false: allow_shell removes directory
+# confinement entirely, so it must never become the default by accident for
+# someone who installed this without reading the README. Operators who
+# knowingly accept that (e.g. delegating whole features that reliably need a
+# shell) can flip it once for their own machine.
+DEFAULT_ALLOW_SHELL = _env_bool("ANTIGRAVITY_ALLOW_SHELL", False)
 
 # Extra seconds of grace beyond agy's own --print-timeout before this server
 # force-kills a subprocess that ignored it.
@@ -346,12 +361,20 @@ mcp = FastMCP(
     ),
 )
 
+if DEFAULT_ALLOW_SHELL:
+    logger.warning(
+        "ANTIGRAVITY_ALLOW_SHELL is set: delegations default to shell access, "
+        "which removes directory confinement and lets sub-agents read other "
+        "delegations' stored transcripts. Pass allow_shell=false per call to "
+        "opt back out."
+    )
+
 
 @mcp.tool
 async def delegate_to_antigravity(
     task: str,
     directory: str,
-    allow_shell: bool = False,
+    allow_shell: bool | None = None,
     read_only: bool = False,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     model: str | None = DEFAULT_MODEL,
@@ -382,9 +405,12 @@ async def delegate_to_antigravity(
             that with this flag agy reads and writes files anywhere on the
             filesystem, and will read other delegations' stored transcripts
             under ~/.gemini/antigravity-cli/. Treat it as granting full
-            user-account access. Leave it off unless a task genuinely needs to
-            run a command; note that a task needing a shell is CANCELED
-            outright when this is off, rather than partially completed.
+            user-account access. Defaults to off (or to the
+            ANTIGRAVITY_ALLOW_SHELL environment variable, if the operator set
+            it). Note the tradeoff: with it off, a task that reaches for a
+            command is CANCELED outright rather than partially completed, so
+            large multi-step tasks tend to need it while single-file edits
+            usually do not.
         read_only: Runs agy in plan mode (`--mode plan`): it investigates and
             writes an implementation plan, but does not modify files in
             `directory`. Cannot be combined with allow_shell.
@@ -407,11 +433,21 @@ async def delegate_to_antigravity(
         raise ToolError(
             "`task` is required: describe the work the sub-agent should carry out."
         )
-    if read_only and allow_shell:
-        raise ToolError(
-            "`read_only` and `allow_shell` are contradictory: shell access would "
-            "let the sub-agent modify the workspace. Enable at most one."
-        )
+
+    # An explicit allow_shell=True alongside read_only is a genuine contradiction
+    # and should be reported. But when allow_shell is merely inheriting an
+    # operator's ANTIGRAVITY_ALLOW_SHELL default, an explicit read_only is the
+    # more specific intent and quietly wins -- otherwise setting that variable
+    # would break every read_only call.
+    if read_only:
+        if allow_shell:
+            raise ToolError(
+                "`read_only` and `allow_shell` are contradictory: shell access "
+                "would let the sub-agent modify the workspace. Enable at most one."
+            )
+        allow_shell = False
+    elif allow_shell is None:
+        allow_shell = DEFAULT_ALLOW_SHELL
 
     workspace = _resolve_workspace(directory)
     timeout = _validate_timeout(timeout_seconds)

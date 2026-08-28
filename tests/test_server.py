@@ -105,6 +105,31 @@ def test_env_int_reads_valid_value(monkeypatch: pytest.MonkeyPatch) -> None:
     assert srv._env_int("SOME_INT", 900) == 120
 
 
+@pytest.mark.parametrize("raw", ["1", "true", "TRUE", "yes", "on"])
+def test_env_bool_accepts_truthy(monkeypatch: pytest.MonkeyPatch, raw: str) -> None:
+    monkeypatch.setenv("SOME_BOOL", raw)
+    assert srv._env_bool("SOME_BOOL", False) is True
+
+
+@pytest.mark.parametrize("raw", ["0", "false", "no", "off", "maybe", ""])
+def test_env_bool_rejects_everything_else(
+    monkeypatch: pytest.MonkeyPatch, raw: str
+) -> None:
+    monkeypatch.setenv("SOME_BOOL", raw)
+    assert srv._env_bool("SOME_BOOL", False) is False
+
+
+def test_env_bool_unset_uses_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SOME_BOOL", raising=False)
+    assert srv._env_bool("SOME_BOOL", True) is True
+
+
+def test_allow_shell_ships_disabled() -> None:
+    # Guards the shipped security posture: allow_shell removes directory
+    # confinement, so it must never default on without an operator opting in.
+    assert srv.DEFAULT_ALLOW_SHELL is False
+
+
 # --------------------------------------------------------------------------- #
 # Binary discovery
 # --------------------------------------------------------------------------- #
@@ -283,7 +308,9 @@ async def test_tool_is_registered_with_expected_schema() -> None:
         "conversation_id",
     ):
         assert param in schema["properties"]
-    assert schema["properties"]["allow_shell"]["default"] is False
+    # allow_shell is nullable so an omitted value can fall back to the
+    # operator's ANTIGRAVITY_ALLOW_SHELL default; read_only stays a plain bool.
+    assert schema["properties"]["allow_shell"]["default"] is None
     assert schema["properties"]["read_only"]["default"] is False
     assert (tools[0].description or "").strip()
 
@@ -313,7 +340,9 @@ async def test_blank_task_is_rejected(workspace: Path, fake_agy) -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_only_and_allow_shell_conflict(workspace: Path, fake_agy) -> None:
+async def test_read_only_and_explicit_allow_shell_conflict(
+    workspace: Path, fake_agy
+) -> None:
     message = await _call_expecting_error(
         {
             "task": "Audit this",
@@ -323,6 +352,41 @@ async def test_read_only_and_allow_shell_conflict(workspace: Path, fake_agy) -> 
         }
     )
     assert "contradictory" in message
+
+
+@pytest.mark.asyncio
+async def test_env_default_enables_shell(
+    workspace: Path, fake_agy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(srv, "DEFAULT_ALLOW_SHELL", True)
+    # The fake echoes argv, so this proves the default reached the subprocess.
+    text = await _text({"task": "x", "directory": str(workspace)})
+    assert "--dangerously-skip-permissions" in text
+
+
+@pytest.mark.asyncio
+async def test_explicit_false_overrides_env_default(
+    workspace: Path, fake_agy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(srv, "DEFAULT_ALLOW_SHELL", True)
+    text = await _text(
+        {"task": "x", "directory": str(workspace), "allow_shell": False}
+    )
+    assert "--dangerously-skip-permissions" not in text
+
+
+@pytest.mark.asyncio
+async def test_read_only_wins_over_env_default_instead_of_erroring(
+    workspace: Path, fake_agy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Regression guard: with the operator default on, read_only calls must still
+    # work rather than tripping the contradiction check.
+    monkeypatch.setattr(srv, "DEFAULT_ALLOW_SHELL", True)
+    text = await _text(
+        {"task": "audit", "directory": str(workspace), "read_only": True}
+    )
+    assert "--dangerously-skip-permissions" not in text
+    assert "--mode" in text and "plan" in text
 
 
 @pytest.mark.asyncio
