@@ -4,83 +4,97 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-An [MCP](https://modelcontextprotocol.io) server that lets Claude Code hand off
-self-contained coding and research tasks to
+A [Model Context Protocol](https://modelcontextprotocol.io) server that allows
+Claude Code to delegate coding and research tasks to
 [Google Antigravity](https://antigravity.google) sub-agents running locally
-against a specific directory.
+against a specified directory.
 
-Claude stays on architecture, logic, and review. Antigravity does the legwork.
-Because it drives the Antigravity CLI (`agy`) rather than the Gemini API, the
-work bills against **the Google account you're already logged into** — an AI
-Pro/Ultra subscription applies, with no separate API key.
+The server drives the Antigravity CLI (`agy`) as a subprocess rather than calling
+the Gemini API. Work therefore bills against the Google account that `agy` is
+already signed in to, so an AI Pro or Ultra subscription applies and no separate
+API key is required.
 
 ```
-Claude Code  ──MCP──▶  antigravity-delegate  ──subprocess──▶  agy  ──▶  your Antigravity account
+Claude Code  --MCP-->  antigravity-delegate  --subprocess-->  agy  -->  Antigravity account
 ```
 
----
+## Contents
 
-## Table of contents
-
+- [Motivation](#motivation)
 - [Requirements](#requirements)
-- [Setup](#setup)
-- [Verify it works](#verify-it-works)
+- [Installation](#installation)
+- [Verification](#verification)
 - [Usage](#usage)
 - [Tool reference](#tool-reference)
-- [Permissions and safety](#permissions-and-safety)
-- [Reducing Claude Code token burn](#reducing-claude-code-token-burn)
 - [Configuration](#configuration)
+- [Security model](#security-model)
+- [Performance and cost](#performance-and-cost)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
+- [Compatibility](#compatibility)
 - [License](#license)
 
----
+## Motivation
+
+Claude Code's context window is a metered resource. An Antigravity subscription
+is a flat-rate one. Delegation moves token-heavy work from the former to the
+latter.
+
+Delegating replaces the two operations that consume context fastest: reading
+source files into context, and emitting generated code as output tokens. Claude
+retains the work that genuinely requires its context, such as architectural
+decisions, reasoning about existing code, and reviewing returned output.
+Antigravity absorbs the mechanical implementation work.
+
+Measured results are given in [Performance and cost](#performance-and-cost).
 
 ## Requirements
 
-| | |
+| Component | Requirement |
 | --- | --- |
-| **Python** | 3.10 or newer |
-| **Antigravity CLI** (`agy`) | Installed and logged in — [install docs](https://antigravity.google/docs/cli/install/) |
-| **Claude Code** | Or any other MCP client |
+| Python | 3.10 or newer |
+| Antigravity CLI (`agy`) | Installed and authenticated. See [installation docs](https://antigravity.google/docs/cli/install/). |
+| MCP client | Claude Code, or any other MCP-compatible client |
 
-No Gemini API key is needed.
+No Gemini API key is required.
 
----
-
-## Setup
+## Installation
 
 ### 1. Install the Antigravity CLI
 
-**Windows (PowerShell):**
+Windows (PowerShell):
 
 ```powershell
 irm https://antigravity.google/cli/install.ps1 | iex
 ```
 
-**macOS / Linux:**
+macOS and Linux:
 
 ```bash
 curl -fsSL https://antigravity.google/cli/install.sh | sh
 ```
 
-### 2. Log in — once, interactively
+### 2. Authenticate the CLI
+
+Run `agy` once interactively. This opens a browser for Google sign-in and caches
+credentials in the operating system keyring.
 
 ```bash
 agy
 ```
 
-This opens your browser for Google sign-in and caches the credentials in your OS
-keyring. **You must do this yourself before the server can work**; it runs `agy`
-headlessly and never handles login. Confirm it worked:
+This step must be completed manually before the server can function. The server
+invokes `agy` in headless mode and does not perform authentication itself.
+
+Confirm authentication succeeded:
 
 ```bash
 agy models
 ```
 
-A list of models means you're authenticated.
+A list of available models indicates the CLI is authenticated.
 
-### 3. Clone and install
+### 3. Install the server
 
 ```bash
 git clone https://github.com/Thulnith-0/antigravity-delegate.git
@@ -90,18 +104,21 @@ git clone https://github.com/Thulnith-0/antigravity-delegate.git
 cd antigravity-delegate && python -m venv .venv
 ```
 
-Activate the virtualenv — `.venv\Scripts\activate` on Windows,
-`source .venv/bin/activate` elsewhere — then:
+Activate the virtual environment (`.venv\Scripts\activate` on Windows,
+`source .venv/bin/activate` on macOS and Linux), then install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Register the server with Claude Code
+### 4. Register the server with your MCP client
 
-Create a `.mcp.json` in the directory you want to use it from (or add the
-`mcpServers` entry to your existing one). Use **absolute paths** to the
-virtualenv's interpreter, so the server doesn't depend on an activated shell:
+Create a `.mcp.json` file in the project directory where the server should be
+available, or add the `mcpServers` entry to an existing configuration. Use
+absolute paths to the virtual environment's interpreter so that the server does
+not depend on an activated shell.
+
+macOS and Linux:
 
 ```json
 {
@@ -114,8 +131,7 @@ virtualenv's interpreter, so the server doesn't depend on an activated shell:
 }
 ```
 
-On Windows the interpreter is `.venv\Scripts\python.exe`, and backslashes must
-be escaped in JSON:
+Windows (note that backslashes must be escaped in JSON):
 
 ```json
 {
@@ -128,67 +144,75 @@ be escaped in JSON:
 }
 ```
 
-No `env` block and no secrets are required.
+No environment block and no credentials are required for a default installation.
 
-### 5. Restart Claude Code
+### 5. Restart the MCP client
 
-MCP servers load at session start. **An already-running session will not pick up
-the new config** — quit and reopen Claude Code.
+MCP servers are loaded when a client session starts. An already-running session
+will not detect the new configuration. Quit and reopen Claude Code.
 
----
+## Verification
 
-## Verify it works
+Ask Claude Code to invoke the tool:
 
-Ask Claude Code:
+> Use delegate_to_antigravity to list the contents of ./src and summarise it, with read_only enabled.
 
-> Use delegate_to_antigravity to list what's in ./src and summarise it. Use read_only.
+A returned summary indicates the server is operating correctly.
 
-If you get a summary back, you're set.
+To verify the server independently of any MCP client:
 
-To check the server independently of Claude — Windows:
+Windows:
 
 ```powershell
 .venv\Scripts\python.exe -c "import antigravity_delegate; print('ok')"
 ```
 
-macOS / Linux:
+macOS and Linux:
 
 ```bash
 .venv/bin/python -c "import antigravity_delegate; print('ok')"
 ```
 
-Verified from a clean `git clone`: clone → venv → `pip install -r
-requirements.txt` → import succeeds → `pytest` passes 54 tests.
-
----
+The installation procedure above has been verified from a clean `git clone`:
+clone, virtual environment creation, dependency installation, module import, and
+the full test suite all complete successfully.
 
 ## Usage
 
-Talk to Claude Code normally; it calls the tool when delegation makes sense. You
-can also be explicit:
+Claude Code invokes the tool automatically when delegation is appropriate. It can
+also be requested explicitly:
 
 > Delegate this to Antigravity: add type hints and docstrings to every function in src/utils.py
 
-**Good candidates** — well-scoped, mechanical, verifiable:
+### Suitable tasks
+
+Well-scoped, mechanical work with verifiable output:
 
 - Adding type hints, docstrings, or tests across a module
-- Building a UI component to a written spec
-- Auditing a package for a pattern (`read_only=true`)
-- Repetitive refactors across many files
+- Implementing a UI component from a written specification
+- Auditing a package for a particular pattern (use `read_only`)
+- Repetitive refactoring across multiple files
 
-**Poor candidates:**
+### Unsuitable tasks
 
-- Anything needing back-and-forth — the sub-agent cannot ask questions
+- Work requiring clarification, since the sub-agent cannot ask questions
 - Cross-cutting architectural decisions
-- Work depending on context that exists only in your Claude conversation
+- Work that depends on context existing only in the Claude Code conversation
 
-Each delegation starts fresh, so **task descriptions must be self-contained**.
-Pass `conversation_id` from a previous result to continue where it left off.
+### Operational guidance
 
-> **Review what comes back.** Treat delegated output like a pull request from a
-> capable contractor: usually good, occasionally confidently wrong.
+Each delegation begins a new conversation, so task descriptions must be
+self-contained. Supply `conversation_id` from a previous result to continue an
+earlier session.
 
----
+Decompose large tasks by file. A complete multi-file feature requested in a
+single call is significantly more likely to exceed its timeout than the same work
+issued as one call per file. See
+[Performance and cost](#performance-and-cost) for measurements.
+
+Review returned output before accepting it. Treat a delegated result as a pull
+request from an external contributor: generally sound, occasionally incorrect
+with high confidence.
 
 ## Tool reference
 
@@ -196,255 +220,262 @@ Pass `conversation_id` from a previous result to continue where it left off.
 
 | Parameter | Type | Default | Description |
 | --- | --- | --- | --- |
-| `task` | string | *required* | Complete, self-contained task description. |
-| `directory` | string | *required* | Absolute path to an existing directory to work in. |
-| `allow_shell` | bool | `false` | Let the sub-agent run shell commands. **Removes directory confinement** — see below. |
-| `read_only` | bool | `false` | Plan mode: investigates and writes a plan without editing files. Cannot combine with `allow_shell`. |
-| `timeout_seconds` | int | `900` | Abort after this many seconds (max 3600). |
-| `model` | string | account default | Model override. Run `agy models` for valid IDs. |
-| `conversation_id` | string | — | Resume a previous run's context. |
+| `task` | string | required | Complete, self-contained task description. |
+| `directory` | string | required | Absolute path to an existing directory in which the sub-agent operates. |
+| `allow_shell` | boolean | `false` | Permits shell command execution. Removes directory confinement. See [Security model](#security-model). |
+| `read_only` | boolean | `false` | Plan mode. The sub-agent investigates and produces an implementation plan without modifying files. Mutually exclusive with `allow_shell`. |
+| `timeout_seconds` | integer | `900` | Abort the run after the specified duration. Maximum 3600. |
+| `model` | string | account default | Model override. Run `agy models` for valid identifiers. |
+| `conversation_id` | string | none | Resume the context of a previous run. |
 
-**Returns** the sub-agent's final answer, followed by elapsed time, token usage,
-the `conversation_id` for chaining, and any diagnostics. If the run ends in a
-non-success state, a warning is placed at the **top** so a partial result isn't
-mistaken for a finished one.
+The tool returns the sub-agent's final response, followed by elapsed time, token
+usage, the `conversation_id` for subsequent chaining, and any diagnostic output.
+If a run terminates in a non-success state, a warning is placed at the beginning
+of the response so that an incomplete result is not mistaken for a finished one.
 
----
+## Configuration
 
-## Permissions and safety
+The following environment variables may be set in the server's `env` block.
 
-Behaviour below was verified by running `agy` 1.1.22 directly, because its
-headless-mode documentation was inconsistent with what the binary does.
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `ANTIGRAVITY_ALLOW_SHELL` | `false` | Default value for `allow_shell`. Review the [Security model](#security-model) before enabling. |
+| `ANTIGRAVITY_TIMEOUT_SECONDS` | `900` | Default run timeout in seconds. |
+| `ANTIGRAVITY_MODEL` | none | Default model for all runs. |
+| `ANTIGRAVITY_LOG_LEVEL` | `INFO` | Server log verbosity. Output is written to stderr only. |
+| `ANTIGRAVITY_CLI_PATH` | none | Explicit path to the `agy` executable if it is not resolvable on `PATH`. |
+| `ANTIGRAVITY_CLI_TIMEOUT_BUFFER_SECONDS` | `30` | Grace period before a non-responsive `agy` process is terminated. |
 
-### Default mode (`allow_shell=false`)
+## Security model
 
-- ✅ Reads and writes files **inside** `directory`
-- ✅ Out-of-workspace access is **auto-denied** (headless mode can't prompt), which
-  is what effectively confines the agent
-- ❌ Shell commands are auto-denied — and a task that needs one is **`CANCELED`
-  outright**, producing no partial work
+The behaviour described in this section was established by direct testing against
+`agy` version 1.1.22, because the published headless-mode documentation did not
+match observed behaviour.
 
-### `allow_shell=true` — understand this before using it
+### Default mode (`allow_shell` disabled)
 
-`agy` has no shell-only approval flag, so this passes
-`--dangerously-skip-permissions`, which auto-approves **every** tool call.
-
-> **⚠️ This removes directory confinement entirely.** Verified: with `--add-dir`
-> pointed at directory A, `agy` was asked to overwrite a file in unrelated
-> directory B and did so successfully. It can read and write anywhere your user
-> account can.
-
-**It also breaks isolation between delegations.** `agy` stores every conversation
-in plaintext under `~/.gemini/antigravity-cli/` (full transcripts in
-`brain/<conversation-id>/`). With `allow_shell=true`, a delegated agent will read
-them: in testing, a fresh delegation asked about a fact it had no access to spent
-58 steps searching the filesystem, found an unrelated earlier delegation's
-transcript, and answered from it. The same probe with `allow_shell=false`
-correctly answered "UNKNOWN".
-
-So anything sent to one delegation may surface in a later, unrelated one —
-including across different projects.
-
-**Recommendations:**
-
-1. Default to `allow_shell=false`; many file-editing tasks complete fine.
-2. Use `read_only=true` for research and review.
-3. Enable `allow_shell` only for directories you'd be comfortable granting full
-   account access to. Not your home directory, not repos holding credentials.
-4. Clear `~/.gemini/antigravity-cli/brain/` between sensitive runs.
-
-### When is `allow_shell` actually needed?
-
-Not always — it correlates with task size more than task type. Measured:
-
-| Task | `allow_shell=false` |
+| Capability | Status |
 | --- | --- |
-| Create a single file | ✅ Succeeded |
-| Add type hints + docstrings across 2 functions | ✅ Succeeded |
-| Read-only research question | ✅ Succeeded |
-| Fix 3 bugs across a module | ❌ `CANCELED` |
-| Build a whole UI feature in one call | ❌ `CANCELED` |
+| Read and write files inside `directory` | Permitted |
+| Access paths outside `directory` | Denied automatically |
+| Execute shell commands | Denied automatically |
 
-Larger, multi-step tasks tend to reach for a command (to verify their own work),
-and that single denial cancels the entire run. **Decomposing a big task into
-per-file calls often keeps it inside the safe mode** as well as making it faster.
+Headless mode cannot present an interactive permission prompt, so any request
+requiring one is denied. That automatic denial is the mechanism that confines the
+sub-agent to the target directory.
+
+A task that requires a shell command is cancelled in its entirety rather than
+completing partially. No output is produced, and tokens consumed up to that point
+are not recovered.
+
+### Shell mode (`allow_shell` enabled)
+
+The Antigravity CLI provides no option to approve shell commands selectively.
+Enabling this parameter passes `--dangerously-skip-permissions`, which
+automatically approves every tool call the sub-agent makes.
+
+**This removes directory confinement entirely.** With `--add-dir` set to one
+directory, the sub-agent was instructed to overwrite a file in an unrelated
+directory and did so successfully. In this mode the sub-agent can read and write
+any location accessible to the current user account.
+
+**This also removes isolation between delegations.** The Antigravity CLI stores
+every conversation in plain text under `~/.gemini/antigravity-cli/`, with full
+transcripts in `brain/<conversation-id>/`. In testing, a new delegation was asked
+for information it had no legitimate access to. It performed 58 steps searching
+the filesystem, located the transcript of an unrelated earlier delegation, and
+answered from its contents. The same query in default mode correctly returned
+"UNKNOWN".
+
+Consequently, information supplied to one delegation may surface in a later,
+unrelated delegation, including across different projects.
+
+### Recommendations
+
+1. Use the default mode wherever possible. Many file-editing tasks complete
+   successfully without shell access.
+2. Use `read_only` for research, auditing, and code review.
+3. Enable `allow_shell` only for directories where granting full user-account
+   access is acceptable. Do not enable it for home directories or repositories
+   containing credentials.
+4. Clear `~/.gemini/antigravity-cli/brain/` between sensitive delegations.
+
+### When shell access is required
+
+Shell access is not universally required. The determining factor is task size
+rather than task type, because larger tasks tend to invoke commands to verify
+their own work.
+
+| Task | Result in default mode |
+| --- | --- |
+| Create a single file | Succeeded |
+| Add type hints and docstrings across two functions | Succeeded |
+| Read-only research query | Succeeded |
+| Fix three defects across a module | Cancelled |
+| Implement a complete UI feature in one call | Cancelled |
+
+Decomposing a large task into per-file calls frequently keeps the work within the
+default mode, in addition to reducing latency.
 
 ### Changing the default
 
-If your workflow genuinely needs shell most of the time, set it once for your
-own machine rather than passing the flag on every call:
+If a workflow consistently requires shell access, set the default once in the
+client configuration rather than passing the parameter on every call:
 
 ```json
 {
   "mcpServers": {
     "antigravity-delegate": {
-      "command": "…/.venv/bin/python",
-      "args": ["…/antigravity_delegate.py"],
+      "command": "/absolute/path/to/.venv/bin/python",
+      "args": ["/absolute/path/to/antigravity_delegate.py"],
       "env": { "ANTIGRAVITY_ALLOW_SHELL": "true" }
     }
   }
 }
 ```
 
-The server logs a warning at startup when this is on. Individual calls still
-override it — `allow_shell=false` opts back out, and `read_only=true` continues
-to work normally rather than conflicting with the default.
+The server emits a warning at startup when this is enabled. Individual calls
+still take precedence: passing `allow_shell` as `false` disables it for that
+call, and `read_only` continues to function normally rather than conflicting with
+the configured default.
 
-The shipped default stays `false` deliberately: this flag grants
-filesystem-wide access, and nobody should acquire that by installing a tool
+The distributed default remains `false` by design. This parameter grants
+filesystem-wide access, which should not be acquired by installing the server
 without reading this section.
 
----
+## Performance and cost
 
-## Reducing Claude Code token burn
+### Context reduction
 
-This is the main reason to use this server. Claude Code's context is a scarce,
-metered resource; your Antigravity subscription is a flat-rate one you have
-already paid for. Delegation **moves work from the scarce budget to the
-flat-rate one**.
+The following measurements are from implementing a responsive pricing section
+(three tier cards, CSS Grid layout, dark mode, and an accessible monthly/yearly
+toggle with live price updates) into an empty static site. The result was 18.9 KB
+of HTML, CSS, and JavaScript across three files, verified functional in a browser.
 
-The saving on Claude's side is real and large, because delegating replaces the
-two things that consume context fastest:
-
-| Doing it in Claude Code | Delegating |
-| --- | --- |
-| Read every relevant file into context | Write one task description |
-| Emit every line of code as output tokens | Read one summary back |
-| Re-read files and iterate on errors | (happens inside Antigravity) |
-
-Claude keeps the work that actually needs its context — architecture, the
-existing codebase's logic, reviewing what comes back. Antigravity absorbs the
-token-heavy legwork.
-
-### Measured: a real UI feature
-
-Building a responsive pricing section (3 tier cards, CSS Grid, dark mode,
-accessible monthly/yearly toggle with live price updates) into a bare static
-site — 18.9 KB of HTML/CSS/JS across three files, verified working in a real
-browser:
-
-| | Claude Code tokens | Antigravity tokens |
+| Approach | Claude Code tokens | Antigravity tokens |
 | --- | --- | --- |
-| **Delegated** (4 calls: prompts + results) | **~2,800** | 412,842 |
-| **Written by Claude directly** (estimated) | ~15,000–25,000 | 0 |
-| **Effect** | **~5–9× less Claude context** | paid by your subscription |
+| Delegated (4 calls) | approximately 2,800 | 412,842 |
+| Implemented directly by Claude (estimated) | 15,000 to 25,000 | 0 |
+| Net effect | 5x to 9x context reduction | billed to subscription |
 
-The Claude-side figure is exact: 5,979 characters of task descriptions sent and
-5,275 characters of results read. The "written directly" figure is an estimate —
-4,729 output tokens for the code itself, plus reading the files, plus the
-reasoning and iteration a UI task normally takes.
+The Claude Code figure is exact: 5,979 characters of task descriptions issued and
+5,275 characters of results returned. The direct-implementation figure is an
+estimate comprising 4,729 output tokens for the generated code, the tokens
+required to read the existing files, and the reasoning and iteration typical of
+UI work.
 
-### The honest catch
+### Delegation efficiency
 
-Those 412K Antigravity tokens bought 18.9 KB of code, and **only ~54% of that
-spend produced anything**:
+Of the 412,842 Antigravity tokens consumed above, approximately 54 percent
+produced usable output.
 
 | Run | Tokens | Outcome |
 | --- | --- | --- |
-| Default mode (`allow_shell=false`) | 39,887 | ❌ `CANCELED` — needed a shell, auto-denied, zero output |
-| `allow_shell=true`, whole task at once | 97,837 | ❌ Timed out at 500s — wrote `index.html` only, left the site broken |
-| Resumed via `conversation_id`, `styles.css` only | 148,443 | ✅ Succeeded in 54s |
-| Fresh conversation, `app.js` only | 126,675 | ✅ Succeeded in 72s |
+| Default mode, complete task | 39,887 | Cancelled. Required shell access. |
+| Shell mode, complete task | 97,837 | Timed out at 500s. Only `index.html` was written. |
+| Resumed via `conversation_id`, `styles.css` only | 148,443 | Succeeded in 54s. |
+| New conversation, `app.js` only | 126,675 | Succeeded in 72s. |
 
-Two lessons, both learned the expensive way:
+Two conclusions follow:
 
-1. **Decompose UI tasks by file.** The whole feature at once timed out; one file
-   per call succeeded in about a minute each.
-2. **Resuming carries the failure's cost.** Run 3 resumed the timed-out
-   conversation and inherited its history — 148K tokens for one CSS file. The
-   fresh run in step 4 did comparable work for less. Start fresh unless you
-   genuinely need the prior context.
+1. **Decompose UI tasks by file.** The complete feature requested in one call
+   exceeded its timeout. Individual files completed in approximately one minute
+   each.
+2. **Resuming a conversation inherits its accumulated cost.** The third run
+   resumed the timed-out conversation and carried its history, consuming 148,443
+   tokens for a single stylesheet. The fourth run performed comparable work in a
+   new conversation for less.
 
-### Per-task reference
+### Conversation resumption
 
-| Task | Tokens |
-| --- | --- |
-| Write a one-line file | ~25K |
-| Add type hints + docstrings to 2 small functions | ~49K |
-| Fix 3 bugs in a 20-line module | ~208K |
-| One file of a UI feature (scoped well) | ~127K |
-| A run that timed out without finishing | ~220K |
+The `conversation_id` parameter provides continuity, not cost reduction. Its
+effect on token consumption depends on the task:
 
-Keep `timeout_seconds` tight so failures fail fast and cheap.
-
-### About `conversation_id`
-
-Resuming is for **continuity, not savings**. Measured both directions:
-
-| Follow-up | Resumed | Fresh | Effect |
+| Follow-up task | Resumed | New conversation | Difference |
 | --- | --- | --- | --- |
-| Question about an already-read file | 36.8K | 30.2K | **+22% worse** |
-| Recall a fact not derivable from disk | 20.8K | 167.6K | **−88% better** |
+| Question about a previously read file | 36,800 | 30,200 | 22 percent higher |
+| Recall of a fact not derivable from disk | 20,800 | 167,600 | 88 percent lower |
 
-Use it when restating context would be long or error-prone. Omit it for
-independent tasks.
+Use resumption when restating context would be lengthy or error-prone. Omit it
+for independent tasks, where a new conversation is generally less expensive.
 
----
+### Reference measurements
 
-## Configuration
+| Task | Approximate tokens |
+| --- | --- |
+| Write a single-line file | 25,000 |
+| Add type hints and docstrings to two functions | 49,000 |
+| Fix three defects in a 20-line module | 208,000 |
+| One file of a UI feature, appropriately scoped | 127,000 |
+| A run that timed out without completing | 220,000 |
 
-Optional environment variables, set in the server's `env` block:
-
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `ANTIGRAVITY_ALLOW_SHELL` | `false` | Default for `allow_shell`. **Read [Permissions and safety](#permissions-and-safety) before enabling.** |
-| `ANTIGRAVITY_TIMEOUT_SECONDS` | `900` | Default run timeout. |
-| `ANTIGRAVITY_MODEL` | — | Default model for every run. |
-| `ANTIGRAVITY_LOG_LEVEL` | `INFO` | Server log verbosity (stderr only). |
-| `ANTIGRAVITY_CLI_PATH` | — | Explicit path to `agy` if it isn't on `PATH`. |
-| `ANTIGRAVITY_CLI_TIMEOUT_BUFFER_SECONDS` | `30` | Grace period before force-killing a hung `agy`. |
-
----
+Set `timeout_seconds` conservatively so that failures terminate quickly.
 
 ## Troubleshooting
 
-**The tool doesn't appear in Claude Code.**
-Restart Claude Code — servers load at session start. Verify your `.mcp.json` is
-valid JSON with correctly escaped backslashes, and that both absolute paths exist.
+**The tool does not appear in the MCP client.**
+Restart the client, as servers are loaded at session start. Confirm that
+`.mcp.json` contains valid JSON with correctly escaped backslashes, and that both
+absolute paths exist.
 
 **`Could not find the Antigravity CLI ('agy')`.**
-`agy` isn't on `PATH`. Set `ANTIGRAVITY_CLI_PATH` to its full path — on Windows,
-usually `C:\Users\<you>\AppData\Local\agy\bin\agy.exe`.
+The executable is not resolvable on `PATH`. Set `ANTIGRAVITY_CLI_PATH` to its
+full path. On Windows this is typically
+`C:\Users\<username>\AppData\Local\agy\bin\agy.exe`.
 
-**`authentication required`, or empty responses.**
-Your `agy` login expired. Run `agy` interactively to sign in again, then confirm
-with `agy models`.
+**Authentication errors or empty responses.**
+The CLI session has expired. Run `agy` interactively to sign in again, then
+confirm with `agy models`.
 
-**The run returns `CANCELED` with a "permission" diagnostic.**
-The task needed a shell command, which is auto-denied in default mode. Either
-rewrite the task to avoid shell, or pass `allow_shell=true` after reading
-[Permissions and safety](#permissions-and-safety).
+**A run returns `CANCELED` with a permission diagnostic.**
+The task required a shell command, which is denied in default mode. Either
+restructure the task to avoid shell execution, or enable `allow_shell` after
+reviewing the [Security model](#security-model).
 
-**Runs time out.**
-Raise `timeout_seconds` (max 3600), or split the task. Anything already written
-to disk stays there.
-
----
+**Runs exceed their timeout.**
+Increase `timeout_seconds` up to the maximum of 3600, or decompose the task.
+Files already written to disk are retained.
 
 ## Development
+
+Install development dependencies:
 
 ```bash
 pip install -r requirements-dev.txt
 ```
 
+Run the test suite:
+
 ```bash
 pytest
 ```
 
-38 tests cover validation, argv construction, subprocess handling, result
-formatting, and the MCP tool boundary. The `agy` binary is replaced by a stand-in
-(`tests/fakes/fake_agy.py`), so the suite makes no live calls and needs no
-credentials or Antigravity install. CI runs it on Python 3.10–3.12.
+The suite contains 54 tests covering input validation, argument construction,
+subprocess handling, result formatting, and the MCP tool boundary. The `agy`
+binary is replaced by a stand-in implementation (`tests/fakes/fake_agy.py`), so
+no test performs a live API call. The suite requires neither credentials nor an
+Antigravity installation. Continuous integration runs it on Python 3.10, 3.11,
+and 3.12.
+
+### Project layout
 
 ```
-antigravity_delegate.py   # the server (single module)
+antigravity_delegate.py     Server implementation (single module)
 tests/
-  test_server.py
-  fakes/fake_agy.py       # stand-in binary for tests
+  test_server.py            Test suite
+  fakes/fake_agy.py         Stand-in for the agy binary
 ```
 
----
+## Compatibility
+
+Behaviour documented here was verified on Windows against `agy` version 1.1.22.
+Continuous integration confirms the test suite passes on Linux, but live
+delegations have not been exercised on macOS or Linux.
+
+The Antigravity CLI updates itself automatically, so its behaviour may diverge
+from what is documented here. If observed behaviour contradicts this document,
+please open an issue reporting the `agy` version in use.
 
 ## License
 
-[MIT](LICENSE)
+Released under the [MIT License](LICENSE).
