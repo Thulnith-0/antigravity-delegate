@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "antigravity-delegate": {
+      "command": "C:\\path\\to\\repo\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\repo\\antigravity_mcp.py"],
+      "env": {
+        "GEMINI_API_KEY": "your-key-here"
+      }
+    }
+  }
+}
