@@ -52,23 +52,30 @@ ships a compiled runtime binary that only the published wheels contain.
 
 Add the server to your client's MCP config, using the **absolute path** to the
 virtualenv's interpreter so the server does not depend on an activated shell.
+For Claude Code, a `.mcp.json` in the project root works:
 
 ```json
 {
   "mcpServers": {
     "antigravity-delegate": {
       "command": "/absolute/path/to/repo/.venv/bin/python",
-      "args": ["/absolute/path/to/repo/antigravity_mcp.py"],
-      "env": {
-        "GEMINI_API_KEY": "your-key-here"
-      }
+      "args": ["/absolute/path/to/repo/antigravity_mcp.py"]
     }
   }
 }
 ```
 
+That block needs **no secrets at all** -- `delegate_to_antigravity_cli` uses
+whatever account `agy` is logged into. Add an `env` block with `GEMINI_API_KEY`
+only if you also want the SDK-backed tool (see
+[mcp_config.example.json](mcp_config.example.json)); without it that one tool
+reports missing credentials and the CLI tool still works.
+
 On Windows the interpreter is `.venv\Scripts\python.exe`, and backslashes must be
 escaped in JSON (`C:\\path\\to\\repo\\.venv\\Scripts\\python.exe`).
+
+MCP servers are loaded when a session starts, so **start a new client session**
+after editing the config -- an already-running one will not pick it up.
 
 > **Keep your key out of git.** The config above holds a live credential. Store it
 > in your client's own config file outside this repo, or in an untracked file —
@@ -166,6 +173,34 @@ inconsistent, so this is what the binary actually does, not what the docs say):
 > this folder". The SDK tool (`delegate_to_antigravity`) keeps its
 > policy-enforced `workspaces` boundary for file tools even when
 > `allow_shell=true`, and is the safer choice if you need shell access.
+
+### The practical tradeoff (measured, not theoretical)
+
+`allow_shell` is not a fine-tuning knob on this tool -- it decides whether real
+work is possible at all. Measured on the same three-bug refactoring task:
+
+| `allow_shell` | Outcome | Cost |
+| --- | --- | --- |
+| `false` | **Failed.** `agy` reached for a shell command during normal work, headless mode auto-denied it, and the entire run was `CANCELED` -- no edits, no output, no partial progress. | ~81K tokens, wasted |
+| `true` | **Succeeded.** All three bugs fixed correctly (verified by independent behavioral tests), no stray files. | ~208K tokens |
+
+So on the CLI tool the choice is effectively:
+
+- `allow_shell=false` -- safe, but unable to finish most real coding tasks. Fine
+  for read-only research and small single-file edits that never need a command.
+- `allow_shell=true` -- capable, but with **no directory confinement at all**.
+
+If you need both capability *and* a file sandbox, use the SDK tool
+(`delegate_to_antigravity`), which enforces `workspaces` independently of shell
+access -- at the cost of needing a separate API key instead of your
+subscription.
+
+### Cost
+
+Delegated runs are not cheap, and they bill against whichever account the tool
+uses. Observed: ~25K tokens for a one-line file write, ~208K for the small
+refactor above, and ~220K for a single run that timed out without finishing.
+Budget accordingly, and prefer `timeout_seconds` low enough to fail fast.
 
 ## Tests
 

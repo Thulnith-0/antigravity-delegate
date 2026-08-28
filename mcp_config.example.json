@@ -1,6 +1,15 @@
 {
+  "_comment": "Copy one of the two server blocks below into your MCP client's config (for Claude Code, a .mcp.json in the project root, or your user-level config). Replace the absolute paths. Keep only one 'antigravity-delegate' key.",
+
   "mcpServers": {
     "antigravity-delegate": {
+      "_comment_cli_only": "No secrets needed: delegate_to_antigravity_cli uses whatever Google account `agy` is logged into. delegate_to_antigravity (the SDK tool) will report missing credentials if called without a key, which is harmless.",
+      "command": "C:\\path\\to\\repo\\.venv\\Scripts\\python.exe",
+      "args": ["C:\\path\\to\\repo\\antigravity_mcp.py"]
+    },
+
+    "_antigravity-delegate-with-sdk-key": {
+      "_comment_with_key": "Use this variant instead if you also want the SDK-backed tool. Do NOT commit a real key.",
       "command": "C:\\path\\to\\repo\\.venv\\Scripts\\python.exe",
       "args": ["C:\\path\\to\\repo\\antigravity_mcp.py"],
       "env": {

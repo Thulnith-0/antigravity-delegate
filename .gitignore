@@ -21,3 +21,6 @@ claude_mcp_config.json
 .idea/
 .DS_Store
 Thumbs.db
+
+# Machine-specific MCP config (absolute paths); see mcp_config.example.json
+.mcp.json
