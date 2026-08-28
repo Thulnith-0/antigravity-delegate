@@ -1,5 +1,3 @@
-# Runtime dependencies.
-# Install the SDK from PyPI, not from a git clone: google-antigravity ships a
-# compiled runtime binary that only the published wheels contain.
+# Runtime dependency. The Antigravity CLI (`agy`) is a separate install --
+# see the README; it is not a Python package.
 fastmcp>=3.4.7,<4
-google-antigravity>=0.1.15,<0.2
