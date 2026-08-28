@@ -268,32 +268,35 @@ def test_format_reports_trace_failure_without_losing_answer(workspace: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_tool_is_registered_with_expected_schema() -> None:
+async def test_both_tools_registered_with_expected_schema() -> None:
     async with Client(srv.mcp) as client:
         tools = await client.list_tools()
 
-    assert [t.name for t in tools] == ["delegate_to_antigravity"]
-    schema = tools[0].inputSchema
-    assert set(schema["required"]) == {"task", "directory"}
-    for param in (
-        "task",
-        "directory",
-        "allow_shell",
-        "read_only",
-        "timeout_seconds",
-        "model",
-    ):
-        assert param in schema["properties"]
-    assert schema["properties"]["allow_shell"]["default"] is False
-    assert schema["properties"]["read_only"]["default"] is False
-    assert (tools[0].description or "").strip()
+    by_name = {t.name: t for t in tools}
+    assert set(by_name) == {"delegate_to_antigravity", "delegate_to_antigravity_cli"}
+
+    for tool in by_name.values():
+        schema = tool.inputSchema
+        assert set(schema["required"]) == {"task", "directory"}
+        for param in (
+            "task",
+            "directory",
+            "allow_shell",
+            "read_only",
+            "timeout_seconds",
+            "model",
+        ):
+            assert param in schema["properties"]
+        assert schema["properties"]["allow_shell"]["default"] is False
+        assert schema["properties"]["read_only"]["default"] is False
+        assert (tool.description or "").strip()
 
 
-async def _call_expecting_error(arguments: dict) -> str:
+async def _call_expecting_error(
+    arguments: dict, tool_name: str = "delegate_to_antigravity"
+) -> str:
     async with Client(srv.mcp) as client:
-        result = await client.call_tool(
-            "delegate_to_antigravity", arguments, raise_on_error=False
-        )
+        result = await client.call_tool(tool_name, arguments, raise_on_error=False)
     assert result.is_error, "expected the call to fail"
     return "".join(getattr(block, "text", "") for block in result.content)
 
@@ -338,3 +341,215 @@ async def test_missing_credentials_reported_cleanly(
     )
     assert "No Gemini credentials" in message
     assert "GEMINI_API_KEY" in message
+
+
+# --------------------------------------------------------------------------- #
+# CLI backend (agy)
+# --------------------------------------------------------------------------- #
+
+FAKE_AGY = Path(__file__).resolve().parent / "fakes" / "fake_agy.py"
+
+
+@pytest.fixture
+def fake_agy(monkeypatch: pytest.MonkeyPatch):
+    """Points the CLI backend at the fake stand-in instead of a real binary."""
+    monkeypatch.setenv("ANTIGRAVITY_CLI_PATH", str(FAKE_AGY))
+    # CLI_SUBPROCESS_TIMEOUT_BUFFER is read from the env once at import time
+    # (like DEFAULT_TIMEOUT_SECONDS), so monkeypatching the env var here would
+    # have no effect on the already-computed constant. Patch it directly so
+    # the timeout test doesn't sit through the real ~30s default buffer.
+    monkeypatch.setattr(srv, "CLI_SUBPROCESS_TIMEOUT_BUFFER", 1)
+
+    def _set(behavior: str) -> None:
+        monkeypatch.setenv("FAKE_AGY_BEHAVIOR", behavior)
+
+    _set("success")
+    return _set
+
+
+def test_find_cli_binary_honors_override(fake_agy) -> None:
+    assert srv._find_cli_binary() == FAKE_AGY
+
+
+def test_find_cli_binary_rejects_missing_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("ANTIGRAVITY_CLI_PATH", str(tmp_path / "nope.exe"))
+    with pytest.raises(ToolError, match="does not exist"):
+        srv._find_cli_binary()
+
+
+def test_find_cli_binary_raises_when_nothing_found(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("ANTIGRAVITY_CLI_PATH", raising=False)
+    monkeypatch.setattr(srv.shutil, "which", lambda name: None)
+    monkeypatch.setattr(srv, "WINDOWS_DEFAULT_CLI_PATH", tmp_path / "missing.exe")
+    with pytest.raises(ToolError, match="Could not find the Antigravity CLI"):
+        srv._find_cli_binary()
+
+
+def test_cli_command_prefix_routes_py_through_interpreter() -> None:
+    assert srv._cli_command_prefix(FAKE_AGY) == [sys.executable, str(FAKE_AGY)]
+
+
+def test_cli_command_prefix_runs_binary_directly(tmp_path: Path) -> None:
+    fake_exe = tmp_path / "agy.exe"
+    assert srv._cli_command_prefix(fake_exe) == [str(fake_exe)]
+
+
+def test_build_cli_args_default(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "do the thing", workspace,
+        allow_shell=False, read_only=False, timeout_seconds=120, model=None,
+    )
+    assert args[:2] == ["-p", "do the thing"]
+    assert "--add-dir" in args and str(workspace) in args
+    assert "--output-format" in args and "json" in args
+    assert "--print-timeout" in args and "120s" in args
+    assert "--disable-slash-commands" in args
+    assert "--mode" not in args
+    assert "--dangerously-skip-permissions" not in args
+
+
+def test_build_cli_args_read_only_uses_plan_mode(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "audit this", workspace,
+        allow_shell=False, read_only=True, timeout_seconds=60, model=None,
+    )
+    i = args.index("--mode")
+    assert args[i + 1] == "plan"
+
+
+def test_build_cli_args_allow_shell_skips_permissions(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "run tests", workspace,
+        allow_shell=True, read_only=False, timeout_seconds=60, model=None,
+    )
+    assert "--dangerously-skip-permissions" in args
+
+
+def test_build_cli_args_model_override(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "x", workspace,
+        allow_shell=False, read_only=False, timeout_seconds=60,
+        model="claude-sonnet-4-6",
+    )
+    i = args.index("--model")
+    assert args[i + 1] == "claude-sonnet-4-6"
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_success(
+    workspace: Path, fake_agy
+) -> None:
+    async with Client(srv.mcp) as client:
+        result = await client.call_tool(
+            "delegate_to_antigravity_cli",
+            {"task": "do a thing", "directory": str(workspace)},
+        )
+    text = "".join(getattr(b, "text", "") for b in result.content)
+    assert "fake response for argv=" in text
+    assert "Tokens: 49" in text
+    assert "Warning" not in text
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_surfaces_shell_denied_diagnostics(
+    workspace: Path, fake_agy
+) -> None:
+    fake_agy("shell_denied")
+    async with Client(srv.mcp) as client:
+        result = await client.call_tool(
+            "delegate_to_antigravity_cli",
+            {"task": "run a command", "directory": str(workspace)},
+        )
+    text = "".join(getattr(b, "text", "") for b in result.content)
+    assert not result.is_error
+    assert "finished without a response" in text
+    assert "auto-denied" in text
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_handles_malformed_json(
+    workspace: Path, fake_agy
+) -> None:
+    fake_agy("malformed_json")
+    async with Client(srv.mcp) as client:
+        result = await client.call_tool(
+            "delegate_to_antigravity_cli",
+            {"task": "x", "directory": str(workspace)},
+        )
+    text = "".join(getattr(b, "text", "") for b in result.content)
+    assert not result.is_error
+    assert "not json at all" in text
+    assert "not valid JSON" in text
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_reports_nonzero_exit(
+    workspace: Path, fake_agy
+) -> None:
+    fake_agy("nonzero_no_output")
+    async with Client(srv.mcp) as client:
+        result = await client.call_tool(
+            "delegate_to_antigravity_cli",
+            {"task": "x", "directory": str(workspace)},
+            raise_on_error=False,
+        )
+    text = "".join(getattr(b, "text", "") for b in result.content)
+    assert result.is_error
+    assert "exited with code 1" in text
+    assert "simulated crash" in text
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_kills_hung_process_and_times_out(
+    workspace: Path, fake_agy
+) -> None:
+    fake_agy("hang")
+    async with Client(srv.mcp) as client:
+        result = await client.call_tool(
+            "delegate_to_antigravity_cli",
+            {"task": "x", "directory": str(workspace), "timeout_seconds": 1},
+            raise_on_error=False,
+        )
+    text = "".join(getattr(b, "text", "") for b in result.content)
+    assert result.is_error
+    assert "did not finish within 1s" in text
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_rejects_conflicting_flags(
+    workspace: Path, fake_agy
+) -> None:
+    message = await _call_expecting_error(
+        {
+            "task": "x",
+            "directory": str(workspace),
+            "read_only": True,
+            "allow_shell": True,
+        },
+        tool_name="delegate_to_antigravity_cli",
+    )
+    assert "contradictory" in message
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_rejects_blank_task(workspace: Path, fake_agy) -> None:
+    message = await _call_expecting_error(
+        {"task": "   ", "directory": str(workspace)},
+        tool_name="delegate_to_antigravity_cli",
+    )
+    assert "`task` is required" in message
+
+
+@pytest.mark.asyncio
+async def test_cli_delegation_rejects_missing_directory(
+    workspace: Path, fake_agy
+) -> None:
+    message = await _call_expecting_error(
+        {"task": "x", "directory": str(workspace / "nope")},
+        tool_name="delegate_to_antigravity_cli",
+    )
+    assert "Could not resolve" in message

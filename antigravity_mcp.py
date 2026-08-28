@@ -1,8 +1,14 @@
 """MCP server that delegates coding and research tasks to Google Antigravity sub-agents.
 
-Exposes a single tool, ``delegate_to_antigravity``, which spins up an Antigravity
-``Agent`` scoped to a caller-supplied directory, runs a task to completion, and
-returns the agent's final answer plus a short trace of what it actually did.
+Exposes two tools that both run a task to completion in a caller-supplied
+directory and return the sub-agent's final answer:
+
+* ``delegate_to_antigravity`` -- the google-antigravity Python SDK, billed as a
+  standalone Gemini API key / GCP project.
+* ``delegate_to_antigravity_cli`` -- the ``agy`` CLI as a subprocess, using
+  whatever Google account it is already logged into (so a subscription such as
+  AI Pro/Ultra applies, unlike the SDK path). Requires ``agy`` to already be
+  installed and logged in; this server never handles that login itself.
 
 Transport is stdio, so nothing may ever be written to stdout except MCP frames --
 all diagnostics go to stderr.
@@ -11,8 +17,10 @@ all diagnostics go to stderr.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import shutil
 import sys
 import time
 from collections import Counter
@@ -78,6 +86,13 @@ MUTATING_TOOL_NAMES = (
 # SDK authenticates through Application Default Credentials and needs no key.
 API_KEY_ENV_VARS = ("GEMINI_API_KEY", "GOOGLE_API_KEY")
 VERTEX_ENV_VARS = ("GOOGLE_GENAI_USE_VERTEXAI", "GOOGLE_GENAI_USE_ENTERPRISE")
+
+# CLI backend (agy). Extra seconds of grace beyond the CLI's own --print-timeout
+# before this server force-kills a hung subprocess itself.
+CLI_SUBPROCESS_TIMEOUT_BUFFER = _env_int("ANTIGRAVITY_CLI_TIMEOUT_BUFFER_SECONDS", 30)
+# Default install location of the Windows installer (antigravity.google/cli/install.ps1).
+# Overridable, and not the only lookup path -- see _find_cli_binary.
+WINDOWS_DEFAULT_CLI_PATH = Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"
 
 DELEGATE_SYSTEM_INSTRUCTIONS = """\
 You are a delegated engineering sub-agent. Another AI agent has handed you a \
@@ -335,6 +350,227 @@ def _format_result(result: DelegationResult, workspace: Path) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# CLI backend (agy)
+#
+# Verified empirically against agy 1.1.22 (docs for headless flags were
+# inconsistent, so behavior below was confirmed by actually running the CLI):
+#   * Default headless mode DOES auto-approve file writes inside the workspace
+#     -- more permissive than the SDK path, where writes need an explicit
+#     CapabilitiesConfig.
+#   * Default headless mode auto-DENIES the "command" (shell) permission with
+#     a clear stderr message, because headless mode cannot prompt for it.
+#     Fails closed, does not hang.
+#   * --mode plan produces a plan without touching files in the workspace --
+#     used here for read_only.
+#   * --add-dir is NOT a hard path sandbox. Out-of-workspace access raises a
+#     permission request that headless mode auto-denies, which is what confines
+#     the agent in default mode. Under --dangerously-skip-permissions that
+#     auto-denial becomes auto-approval: verified that agy then writes to paths
+#     entirely outside --add-dir. So allow_shell=True means no file confinement.
+# --------------------------------------------------------------------------- #
+
+
+def _find_cli_binary() -> Path:
+    """Locates the agy executable.
+
+    Checked in order: an explicit override (also how tests point this at a
+    stand-in), PATH, then the default Windows install location -- agy is not
+    reliably on PATH right after the installer runs in the *current* shell.
+    """
+    override = os.environ.get("ANTIGRAVITY_CLI_PATH")
+    if override:
+        path = Path(override)
+        if not path.exists():
+            raise ToolError(f"ANTIGRAVITY_CLI_PATH={override!r} does not exist.")
+        return path
+
+    found = shutil.which("agy")
+    if found:
+        return Path(found)
+
+    if WINDOWS_DEFAULT_CLI_PATH.exists():
+        return WINDOWS_DEFAULT_CLI_PATH
+
+    raise ToolError(
+        "Could not find the Antigravity CLI ('agy'). Install it "
+        "(https://antigravity.google/docs/cli/install/) and log in once "
+        "interactively, or set ANTIGRAVITY_CLI_PATH to its executable path."
+    )
+
+
+def _cli_command_prefix(binary: Path) -> list[str]:
+    """Builds the subprocess argv prefix for `binary`.
+
+    A `.py` path means a test stand-in (see tests/fakes/fake_agy.py); it has to
+    run through the current interpreter rather than being executed directly.
+    """
+    if binary.suffix == ".py":
+        return [sys.executable, str(binary)]
+    return [str(binary)]
+
+
+def _build_cli_args(
+    task: str,
+    workspace: Path,
+    *,
+    allow_shell: bool,
+    read_only: bool,
+    timeout_seconds: int,
+    model: str | None,
+) -> list[str]:
+    args = [
+        "-p",
+        task,
+        "--add-dir",
+        str(workspace),
+        "--output-format",
+        "json",
+        "--print-timeout",
+        f"{timeout_seconds}s",
+        # The task text originates from another AI agent, not a human at a
+        # keyboard; it should never be reinterpreted as a slash command.
+        "--disable-slash-commands",
+    ]
+    if read_only:
+        args += ["--mode", "plan"]
+    if allow_shell:
+        # Broader than the SDK tool's allow_shell: this auto-approves every
+        # tool call agy makes, not just run_command -- agy has no CLI flag for
+        # shell-only approval (that requires a settings.json allow-rule).
+        args += ["--dangerously-skip-permissions"]
+    if model:
+        args += ["--model", model]
+    return args
+
+
+@dataclass
+class CliDelegationResult:
+    """Everything worth reporting back about one agy CLI run."""
+
+    text: str
+    elapsed_seconds: float
+    status: str | None = None
+    usage: dict | None = None
+    raw_stderr: str = ""
+    parse_error: str | None = None
+
+
+async def _run_cli_delegation(
+    task: str,
+    workspace: Path,
+    *,
+    allow_shell: bool,
+    read_only: bool,
+    timeout_seconds: int,
+    model: str | None,
+) -> CliDelegationResult:
+    binary = _find_cli_binary()
+    command = _cli_command_prefix(binary) + _build_cli_args(
+        task,
+        workspace,
+        allow_shell=allow_shell,
+        read_only=read_only,
+        timeout_seconds=timeout_seconds,
+        model=model,
+    )
+
+    started = time.monotonic()
+    proc = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(workspace),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    try:
+        stdout_bytes, stderr_bytes = await asyncio.wait_for(
+            proc.communicate(),
+            timeout=timeout_seconds + CLI_SUBPROCESS_TIMEOUT_BUFFER,
+        )
+    except asyncio.TimeoutError:
+        # --print-timeout should make agy exit on its own; this is the backstop
+        # if it doesn't, so the subprocess is never left running unattended.
+        proc.kill()
+        await proc.wait()
+        raise ToolError(
+            f"agy did not finish within {timeout_seconds}s and was killed. Any "
+            "files it already wrote are still on disk. Re-run with a larger "
+            "`timeout_seconds`, or split the task into smaller pieces."
+        ) from None
+
+    elapsed = time.monotonic() - started
+    stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
+    stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+    if proc.returncode != 0 and not stdout:
+        raise ToolError(
+            f"agy exited with code {proc.returncode} and produced no output. "
+            f"stderr: {stderr or '(empty)'}"
+        )
+
+    try:
+        payload = json.loads(stdout)
+    except (json.JSONDecodeError, ValueError) as exc:
+        return CliDelegationResult(
+            text=stdout or "(agy produced no parseable output)",
+            elapsed_seconds=elapsed,
+            raw_stderr=stderr,
+            parse_error=str(exc),
+        )
+
+    text = (payload.get("response") or "").strip()
+    if not text:
+        text = "(agy finished without a response; see status/diagnostics below)"
+
+    return CliDelegationResult(
+        text=text,
+        elapsed_seconds=elapsed,
+        status=payload.get("status"),
+        usage=payload.get("usage"),
+        raw_stderr=stderr,
+    )
+
+
+def _format_cli_result(result: CliDelegationResult, workspace: Path) -> str:
+    """Renders the result for the calling agent: answer first, evidence after."""
+    lines = [
+        result.text,
+        "",
+        "---",
+        f"_Antigravity CLI sub-agent - `{workspace}` - {result.elapsed_seconds:.1f}s_",
+    ]
+
+    if result.usage:
+        total = result.usage.get("total_tokens")
+        if total:
+            lines.append(f"_Tokens: {total:,}_")
+
+    if result.parse_error:
+        lines.append(
+            f"_agy's output was not valid JSON ({result.parse_error}); showing "
+            "raw output above instead of a parsed response._"
+        )
+
+    if result.raw_stderr:
+        # agy's stderr carries diagnostics (denied permissions, progress) that
+        # matter for a caller trying to understand a short/empty response --
+        # capped so a noisy run doesn't dominate the reply.
+        snippet = result.raw_stderr[:400]
+        suffix = "..." if len(result.raw_stderr) > 400 else ""
+        lines.append(f"_agy diagnostics: {snippet}{suffix}_")
+
+    if result.status and result.status != "SUCCESS":
+        lines.insert(
+            0,
+            f"> **Warning:** agy reported status `{result.status}`. The result "
+            "below may be incomplete.\n",
+        )
+
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
 # Server
 # --------------------------------------------------------------------------- #
 
@@ -436,6 +672,102 @@ async def delegate_to_antigravity(
         sum(result.tool_calls.values()),
     )
     return _format_result(result, workspace)
+
+
+@mcp.tool
+async def delegate_to_antigravity_cli(
+    task: str,
+    directory: str,
+    allow_shell: bool = False,
+    read_only: bool = False,
+    timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+    model: str | None = DEFAULT_MODEL,
+) -> str:
+    """Delegate a task to Antigravity via the `agy` CLI, using your logged-in account instead of a separate API key.
+
+    Same contract as delegate_to_antigravity (self-contained task, sandboxed
+    directory, no follow-up questions), but runs the Antigravity CLI (agy) as a
+    subprocess instead of the Python SDK. Billing and rate limits come from
+    whatever plan the Google account `agy` is logged into has (e.g. an AI
+    Pro/Ultra subscription) -- not a separate metered Gemini API key.
+
+    Requires `agy` to already be installed and logged in: run it once
+    interactively yourself first so it can complete the browser login. This
+    tool never installs `agy` or handles that login; it only runs it headlessly
+    once credentials are already cached.
+
+    Args:
+        task: The complete task description. Self-contained and specific.
+        directory: Absolute path to the existing directory the sub-agent works
+            in, passed to agy as `--add-dir`. With allow_shell=False this
+            effectively confines the agent, because out-of-workspace access
+            needs a permission that headless mode auto-denies. It is NOT a
+            hard path sandbox -- see allow_shell.
+        allow_shell: DANGEROUS. Passes `--dangerously-skip-permissions`, which
+            auto-approves every tool call agy makes -- agy has no shell-only
+            approval flag. This also removes the directory confinement:
+            verified that with this flag agy will read and write files
+            anywhere on the filesystem, not just `directory`. Treat it as
+            granting full user-account access, not as scoped shell access.
+            Prefer delegate_to_antigravity (the SDK tool), which keeps its
+            file-tool sandbox even with shell enabled. Off by default; even
+            off, agy still edits files inside the workspace, but shell
+            commands are auto-denied with a clear message rather than hanging.
+        read_only: Runs agy in plan mode (`--mode plan`): it investigates and
+            writes an implementation plan, but does not modify files in
+            `directory`. Cannot be combined with allow_shell.
+        timeout_seconds: Abort the run after this many seconds (max 3600).
+            Passed through to agy's own `--print-timeout`.
+        model: Optional model override (see `agy models` for valid IDs;
+            includes non-Gemini models depending on your account).
+
+    Returns:
+        agy's final answer, followed by token usage and any diagnostics.
+    """
+    if not task or not task.strip():
+        raise ToolError(
+            "`task` is required: describe the work the sub-agent should carry out."
+        )
+    if read_only and allow_shell:
+        raise ToolError(
+            "`read_only` and `allow_shell` are contradictory: shell access would "
+            "let the sub-agent modify the workspace. Enable at most one."
+        )
+
+    workspace = _resolve_workspace(directory)
+    timeout = _validate_timeout(timeout_seconds)
+
+    logger.info(
+        "Delegating to agy CLI in %s (shell=%s, read_only=%s, timeout=%ss)",
+        workspace,
+        allow_shell,
+        read_only,
+        timeout,
+    )
+
+    try:
+        result = await _run_cli_delegation(
+            task,
+            workspace,
+            allow_shell=allow_shell,
+            read_only=read_only,
+            timeout_seconds=timeout,
+            model=model,
+        )
+    except ToolError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - surface a usable message to caller
+        logger.exception("CLI delegation failed in %s", workspace)
+        raise ToolError(
+            f"The Antigravity CLI sub-agent failed: {type(exc).__name__}: {exc}"
+        ) from exc
+
+    logger.info(
+        "CLI delegation finished in %.1fs (status=%s)",
+        result.elapsed_seconds,
+        result.status,
+    )
+    return _format_cli_result(result, workspace)
 
 
 if __name__ == "__main__":
