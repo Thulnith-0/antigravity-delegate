@@ -1,6 +1,6 @@
 """Stand-in for the real `agy` binary, driven by the FAKE_AGY_BEHAVIOR env var.
 
-Tests point ANTIGRAVITY_CLI_PATH at this file so antigravity_mcp.py's subprocess
+Tests point ANTIGRAVITY_CLI_PATH at this file so antigravity_delegate.py's subprocess
 and JSON-parsing logic can be exercised without a real Antigravity account.
 Behaviors mirror what was empirically observed from the real CLI (agy 1.1.22):
 default headless mode auto-approves writes but auto-denies shell commands with

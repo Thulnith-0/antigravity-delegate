@@ -143,12 +143,22 @@ Ask Claude Code:
 
 > Use delegate_to_antigravity to list what's in ./src and summarise it. Use read_only.
 
-If you get a summary back, you're set. To check the server independently of
-Claude:
+If you get a summary back, you're set.
+
+To check the server independently of Claude — Windows:
+
+```powershell
+.venv\Scripts\python.exe -c "import antigravity_delegate; print('ok')"
+```
+
+macOS / Linux:
 
 ```bash
 .venv/bin/python -c "import antigravity_delegate; print('ok')"
 ```
+
+Verified from a clean `git clone`: clone → venv → `pip install -r
+requirements.txt` → import succeeds → `pytest` passes 54 tests.
 
 ---
 
