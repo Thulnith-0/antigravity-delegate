@@ -182,7 +182,10 @@ the full test suite all complete successfully.
 Claude Code invokes the tool automatically when delegation is appropriate. It can
 also be requested explicitly:
 
-> Delegate this to Antigravity: add type hints and docstrings to every function in src/utils.py
+> Delegate this to Antigravity with allow_edits enabled: add type hints and docstrings to every function in src/utils.py
+
+Tasks that modify files require `allow_edits`. Without it the sub-agent can read
+and report, but every write is denied and the run is cancelled.
 
 ### Suitable tasks
 
@@ -222,8 +225,9 @@ with high confidence.
 | --- | --- | --- | --- |
 | `task` | string | required | Complete, self-contained task description. |
 | `directory` | string | required | Absolute path to an existing directory in which the sub-agent operates. |
-| `allow_shell` | boolean | `false` | Permits shell command execution. Removes directory confinement. See [Security model](#security-model). |
-| `read_only` | boolean | `false` | Plan mode. The sub-agent investigates and produces an implementation plan without modifying files. Mutually exclusive with `allow_shell`. |
+| `allow_edits` | boolean | `false` | Permits file writes (`--mode accept-edits`). **Required for any task that modifies files.** The shell remains denied, but writes are not confined to `directory`. See [Security model](#security-model). |
+| `allow_shell` | boolean | `false` | Permits shell command execution. Removes directory confinement. Implies `allow_edits`. See [Security model](#security-model). |
+| `read_only` | boolean | `false` | Plan mode. The sub-agent investigates and produces an implementation plan without modifying files. Mutually exclusive with `allow_edits` and `allow_shell`. |
 | `timeout_seconds` | integer | `900` | Abort the run after the specified duration. Maximum 3600. |
 | `model` | string | account default | Model override. Run `agy models` for valid identifiers. |
 | `conversation_id` | string | none | Resume the context of a previous run. |
@@ -239,6 +243,7 @@ The following environment variables may be set in the server's `env` block.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
+| `ANTIGRAVITY_ALLOW_EDITS` | `false` | Default value for `allow_edits`. Set this if most delegations are expected to modify files. Review the [Security model](#security-model) before enabling. |
 | `ANTIGRAVITY_ALLOW_SHELL` | `false` | Default value for `allow_shell`. Review the [Security model](#security-model) before enabling. |
 | `ANTIGRAVITY_TIMEOUT_SECONDS` | `900` | Default run timeout in seconds. |
 | `ANTIGRAVITY_MODEL` | none | Default model for all runs. |
@@ -249,24 +254,45 @@ The following environment variables may be set in the server's `env` block.
 ## Security model
 
 The behaviour described in this section was established by direct testing against
-`agy` version 1.1.22, because the published headless-mode documentation did not
+`agy` version 1.1.24, because the published headless-mode documentation did not
 match observed behaviour.
 
-### Default mode (`allow_shell` disabled)
+### Summary of the three modes
 
-| Capability | Status |
-| --- | --- |
-| Read and write files inside `directory` | Permitted |
-| Access paths outside `directory` | Denied automatically |
-| Execute shell commands | Denied automatically |
+| Capability | Default | `allow_edits` | `allow_shell` |
+| --- | --- | --- | --- |
+| Read files inside `directory` | Permitted | Permitted | Permitted |
+| Write files inside `directory` | **Denied** | Permitted | Permitted |
+| Write files outside `directory` | Denied | **Permitted** | Permitted |
+| Execute shell commands | Denied | Denied | Permitted |
+
+### Default mode
 
 Headless mode cannot present an interactive permission prompt, so any request
 requiring one is denied. That automatic denial is the mechanism that confines the
 sub-agent to the target directory.
 
-A task that requires a shell command is cancelled in its entirety rather than
+This includes file writes. In version 1.1.22 writes inside the workspace were
+approved automatically; as of 1.1.24 they are not. A delegation that attempts to
+modify a file without `allow_edits` is cancelled with a diagnostic naming the
+`write_file` permission, having changed nothing. The default mode is therefore
+useful for reading, research and reporting, but cannot complete editing work.
+
+A task that requires a denied permission is cancelled in its entirety rather than
 completing partially. No output is produced, and tokens consumed up to that point
 are not recovered.
+
+### Edit mode (`allow_edits` enabled)
+
+This parameter passes `--mode accept-edits`, which approves file writes while
+continuing to deny shell commands. It is the appropriate setting for the majority
+of delegations, which need to modify files but not run commands.
+
+**This grant is not confined to `directory`.** With `--add-dir` set to one
+directory, a sub-agent instructed to write to an absolute path in an unrelated
+directory did so successfully. The restriction that remains in this mode is the
+absence of arbitrary command execution, which is a meaningful reduction in
+exposure relative to `allow_shell`, but it is not a path sandbox.
 
 ### Shell mode (`allow_shell` enabled)
 
@@ -292,30 +318,42 @@ unrelated delegation, including across different projects.
 
 ### Recommendations
 
-1. Use the default mode wherever possible. Many file-editing tasks complete
-   successfully without shell access.
-2. Use `read_only` for research, auditing, and code review.
+1. Use the least permission the task requires: `read_only` for research,
+   auditing and code review; `allow_edits` for work that modifies files;
+   `allow_shell` only when commands must actually run.
+2. Prefer `allow_edits` over `allow_shell` for editing work. Most file-editing
+   tasks complete successfully without shell access, and the difference between
+   the two is arbitrary command execution.
 3. Enable `allow_shell` only for directories where granting full user-account
    access is acceptable. Do not enable it for home directories or repositories
    containing credentials.
-4. Clear `~/.gemini/antigravity-cli/brain/` between sensitive delegations.
+4. Treat neither `allow_edits` nor `allow_shell` as a path restriction. If a
+   delegation must not touch a particular tree, the enforcement has to come from
+   outside this server.
+5. Clear `~/.gemini/antigravity-cli/brain/` between sensitive delegations.
 
-### When shell access is required
+### Choosing a permission level
 
-Shell access is not universally required. The determining factor is task size
-rather than task type, because larger tasks tend to invoke commands to verify
-their own work.
+Any task that writes a file requires at least `allow_edits`. Beyond that, the
+determining factor for `allow_shell` is task size rather than task type, because
+larger tasks tend to invoke commands to verify their own work.
 
-| Task | Result in default mode |
+| Task | Minimum required |
 | --- | --- |
-| Create a single file | Succeeded |
-| Add type hints and docstrings across two functions | Succeeded |
-| Read-only research query | Succeeded |
-| Fix three defects across a module | Cancelled |
-| Implement a complete UI feature in one call | Cancelled |
+| Read-only research query | Default |
+| Auditing or planning without changes | `read_only` |
+| Create a single file | `allow_edits` |
+| Add type hints and docstrings across two functions | `allow_edits` |
+| Implement a complete single-file UI from a specification | `allow_edits` |
+| Fix three defects across a module | `allow_shell` |
+| Any task that must install packages, run tests, or use git | `allow_shell` |
 
-Decomposing a large task into per-file calls frequently keeps the work within the
-default mode, in addition to reducing latency.
+Decomposing a large task into per-file calls frequently keeps the work within
+`allow_edits`, in addition to reducing latency.
+
+The measurements in the preceding rows were taken under version 1.1.24. Earlier
+releases approved in-workspace writes without `allow_edits`; if a delegation that
+previously succeeded now returns `CANCELED`, this change is the likely cause.
 
 ### Changing the default
 
@@ -428,9 +466,16 @@ The CLI session has expired. Run `agy` interactively to sign in again, then
 confirm with `agy models`.
 
 **A run returns `CANCELED` with a permission diagnostic.**
-The task required a shell command, which is denied in default mode. Either
-restructure the task to avoid shell execution, or enable `allow_shell` after
-reviewing the [Security model](#security-model).
+The task required a permission that headless mode cannot prompt for. Read the
+diagnostic to determine which one. A `write_file` denial means the task modifies
+files and requires `allow_edits`. A `command` denial means it requires a shell,
+and therefore `allow_shell`. Enable the narrower of the two after reviewing the
+[Security model](#security-model), or restructure the task to avoid the
+permission entirely.
+
+**A delegation reports success but no files changed.**
+The run had no edit permission and reported only what it intended to do. Pass
+`allow_edits` as `true`.
 
 **Runs exceed their timeout.**
 Increase `timeout_seconds` up to the maximum of 3600, or decompose the task.
@@ -468,7 +513,7 @@ tests/
 
 ## Compatibility
 
-Behaviour documented here was verified on Windows against `agy` version 1.1.22.
+Behaviour documented here was verified on Windows against `agy` version 1.1.24.
 Continuous integration confirms the test suite passes on Linux, but live
 delegations have not been exercised on macOS or Linux.
 

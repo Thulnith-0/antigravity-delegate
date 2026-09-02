@@ -70,6 +70,12 @@ DEFAULT_MODEL = os.environ.get("ANTIGRAVITY_MODEL") or None
 # shell) can flip it once for their own machine.
 DEFAULT_ALLOW_SHELL = _env_bool("ANTIGRAVITY_ALLOW_SHELL", False)
 
+# Opt-in default for allow_edits. Also ships false: --mode accept-edits blocks
+# the shell but does NOT confine writes to --add-dir (verified, see below), so
+# it is a real grant of write access to the whole filesystem and should be a
+# deliberate per-call choice rather than a silent default.
+DEFAULT_ALLOW_EDITS = _env_bool("ANTIGRAVITY_ALLOW_EDITS", False)
+
 # Extra seconds of grace beyond agy's own --print-timeout before this server
 # force-kills a subprocess that ignored it.
 CLI_SUBPROCESS_TIMEOUT_BUFFER = _env_int("ANTIGRAVITY_CLI_TIMEOUT_BUFFER_SECONDS", 30)
@@ -123,13 +129,21 @@ def _validate_timeout(timeout_seconds: int) -> int:
 # --------------------------------------------------------------------------- #
 # CLI invocation
 #
-# Verified empirically against agy 1.1.22 (its headless-mode docs were
+# Verified empirically against agy 1.1.24 (its headless-mode docs were
 # inconsistent, so this reflects what the binary actually does):
-#   * Default headless mode auto-approves file writes inside the workspace.
-#   * Default headless mode auto-DENIES the "command" (shell) permission with a
-#     clear stderr message, because it cannot prompt. Fails closed, no hang.
-#     A task that needs a shell is CANCELED outright rather than degraded.
+#   * Default headless mode auto-DENIES the "write_file" permission, because it
+#     cannot prompt. This CHANGED from 1.1.22, where writes inside the workspace
+#     were auto-approved; a plain delegation that writes anything is now CANCELED
+#     with "a tool required the write_file permission". Hence allow_edits.
+#   * Default headless mode likewise auto-DENIES the "command" (shell)
+#     permission. Fails closed, no hang. A task that needs a shell is CANCELED
+#     outright rather than degraded.
 #   * --mode plan investigates and writes a plan without editing the workspace.
+#   * --mode accept-edits auto-approves file writes and still DENIES the shell,
+#     so it is the middle tier between the two. But it is NOT path-confined:
+#     verified that under accept-edits agy writes to absolute paths entirely
+#     outside --add-dir. It narrows the grant to "no arbitrary commands", not
+#     to "only this directory".
 #   * --add-dir is NOT a hard path sandbox. Out-of-workspace access raises a
 #     permission request that headless mode auto-denies, and that denial is what
 #     confines the agent. Under --dangerously-skip-permissions the denial becomes
@@ -182,6 +196,7 @@ def _build_cli_args(
     workspace: Path,
     *,
     allow_shell: bool,
+    allow_edits: bool,
     read_only: bool,
     timeout_seconds: int,
     model: str | None,
@@ -206,6 +221,10 @@ def _build_cli_args(
         args += ["--conversation", conversation_id]
     if read_only:
         args += ["--mode", "plan"]
+    elif allow_edits and not allow_shell:
+        # Redundant under --dangerously-skip-permissions, which already approves
+        # writes, so only the narrower grant is spelled out here.
+        args += ["--mode", "accept-edits"]
     if allow_shell:
         args += ["--dangerously-skip-permissions"]
     if model:
@@ -231,6 +250,7 @@ async def _run_delegation(
     workspace: Path,
     *,
     allow_shell: bool,
+    allow_edits: bool,
     read_only: bool,
     timeout_seconds: int,
     model: str | None,
@@ -241,6 +261,7 @@ async def _run_delegation(
         task,
         workspace,
         allow_shell=allow_shell,
+        allow_edits=allow_edits,
         read_only=read_only,
         timeout_seconds=timeout_seconds,
         model=model,
@@ -339,6 +360,21 @@ def _format_result(result: DelegationResult, workspace: Path) -> str:
         suffix = "..." if len(result.raw_stderr) > 400 else ""
         lines.append(f"_agy diagnostics: {snippet}{suffix}_")
 
+        # The auto-denied-permission message names the tool but not the flag
+        # that would have allowed it, which makes an empty CANCELED run look
+        # inexplicable. Name the fix instead of leaving the caller to guess.
+        if "write_file" in result.raw_stderr and "permission" in result.raw_stderr:
+            lines.append(
+                "_Nothing was written: this run had no edit permission. Retry "
+                "with `allow_edits=true` to let the sub-agent write files._"
+            )
+        elif '"command" permission' in result.raw_stderr:
+            lines.append(
+                "_This task needed a shell command, which is denied by default. "
+                "Retry with `allow_shell=true` only if running commands is "
+                "genuinely required._"
+            )
+
     if result.status and result.status != "SUCCESS":
         lines.insert(
             0,
@@ -369,11 +405,19 @@ if DEFAULT_ALLOW_SHELL:
         "opt back out."
     )
 
+if DEFAULT_ALLOW_EDITS:
+    logger.warning(
+        "ANTIGRAVITY_ALLOW_EDITS is set: delegations default to write access, "
+        "which is not confined to the target directory. Pass allow_edits=false "
+        "per call to opt back out."
+    )
+
 
 @mcp.tool
 async def delegate_to_antigravity(
     task: str,
     directory: str,
+    allow_edits: bool | None = None,
     allow_shell: bool | None = None,
     read_only: bool = False,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
@@ -395,25 +439,35 @@ async def delegate_to_antigravity(
     Args:
         task: The complete task description. Self-contained and specific.
         directory: Absolute path to the existing directory the sub-agent works
-            in, passed to agy as `--add-dir`. With allow_shell=False this
-            effectively confines the agent, because out-of-workspace access
-            needs a permission that headless mode auto-denies. It is NOT a hard
-            path sandbox -- see allow_shell.
+            in, passed to agy as `--add-dir`. With allow_edits and allow_shell
+            both off this effectively confines the agent, because every
+            out-of-workspace access needs a permission that headless mode
+            auto-denies. It is NOT a hard path sandbox -- see allow_edits.
+        allow_edits: REQUIRED FOR ANY TASK THAT WRITES FILES. Passes
+            `--mode accept-edits`. Without it, headless agy auto-denies the
+            write_file permission and the run is CANCELED having changed
+            nothing, so a plain delegation can read and report but never edit.
+            The grant is narrower than allow_shell -- the shell stays denied,
+            so no arbitrary commands -- but it is NOT path-confined: verified
+            that under accept-edits agy writes to absolute paths outside
+            `directory`. Prefer it over allow_shell for anything that only
+            needs to edit files. Defaults to off (or to the
+            ANTIGRAVITY_ALLOW_EDITS environment variable, if the operator set
+            it).
         allow_shell: DANGEROUS. Passes `--dangerously-skip-permissions`, which
             auto-approves every tool call agy makes -- agy has no shell-only
             approval flag. This also removes directory confinement: verified
             that with this flag agy reads and writes files anywhere on the
             filesystem, and will read other delegations' stored transcripts
             under ~/.gemini/antigravity-cli/. Treat it as granting full
-            user-account access. Defaults to off (or to the
-            ANTIGRAVITY_ALLOW_SHELL environment variable, if the operator set
-            it). Note the tradeoff: with it off, a task that reaches for a
-            command is CANCELED outright rather than partially completed, so
-            large multi-step tasks tend to need it while single-file edits
-            usually do not.
+            user-account access. Implies allow_edits. Defaults to off (or to
+            the ANTIGRAVITY_ALLOW_SHELL environment variable, if the operator
+            set it). Reach for it only when the task genuinely needs to run
+            commands -- installing packages, running tests, git operations. A
+            task that merely writes files wants allow_edits instead.
         read_only: Runs agy in plan mode (`--mode plan`): it investigates and
             writes an implementation plan, but does not modify files in
-            `directory`. Cannot be combined with allow_shell.
+            `directory`. Cannot be combined with allow_edits or allow_shell.
         timeout_seconds: Abort the run after this many seconds (max 3600).
             Passed through to agy's own `--print-timeout`.
         model: Optional model override (see `agy models` for valid IDs;
@@ -434,10 +488,10 @@ async def delegate_to_antigravity(
             "`task` is required: describe the work the sub-agent should carry out."
         )
 
-    # An explicit allow_shell=True alongside read_only is a genuine contradiction
-    # and should be reported. But when allow_shell is merely inheriting an
-    # operator's ANTIGRAVITY_ALLOW_SHELL default, an explicit read_only is the
-    # more specific intent and quietly wins -- otherwise setting that variable
+    # An explicit allow_shell/allow_edits=True alongside read_only is a genuine
+    # contradiction and should be reported. But when either is merely inheriting
+    # an operator's ANTIGRAVITY_ALLOW_* default, an explicit read_only is the
+    # more specific intent and quietly wins -- otherwise setting those variables
     # would break every read_only call.
     if read_only:
         if allow_shell:
@@ -445,17 +499,32 @@ async def delegate_to_antigravity(
                 "`read_only` and `allow_shell` are contradictory: shell access "
                 "would let the sub-agent modify the workspace. Enable at most one."
             )
+        if allow_edits:
+            raise ToolError(
+                "`read_only` and `allow_edits` are contradictory: plan mode "
+                "exists precisely to leave the workspace unmodified. Enable at "
+                "most one."
+            )
         allow_shell = False
-    elif allow_shell is None:
-        allow_shell = DEFAULT_ALLOW_SHELL
+        allow_edits = False
+    else:
+        if allow_shell is None:
+            allow_shell = DEFAULT_ALLOW_SHELL
+        if allow_edits is None:
+            allow_edits = DEFAULT_ALLOW_EDITS
+        # --dangerously-skip-permissions already approves writes; keeping the
+        # flags consistent means the logged state matches what agy can do.
+        if allow_shell:
+            allow_edits = True
 
     workspace = _resolve_workspace(directory)
     timeout = _validate_timeout(timeout_seconds)
 
     logger.info(
-        "Delegating to agy in %s (shell=%s, read_only=%s, timeout=%ss)",
+        "Delegating to agy in %s (shell=%s, edits=%s, read_only=%s, timeout=%ss)",
         workspace,
         allow_shell,
+        allow_edits,
         read_only,
         timeout,
     )
@@ -465,6 +534,7 @@ async def delegate_to_antigravity(
             task,
             workspace,
             allow_shell=allow_shell,
+            allow_edits=allow_edits,
             read_only=read_only,
             timeout_seconds=timeout,
             model=model,

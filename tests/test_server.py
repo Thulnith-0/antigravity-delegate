@@ -130,6 +130,12 @@ def test_allow_shell_ships_disabled() -> None:
     assert srv.DEFAULT_ALLOW_SHELL is False
 
 
+def test_allow_edits_ships_disabled() -> None:
+    # accept-edits blocks the shell but is NOT path-confined -- it writes
+    # outside --add-dir -- so it is an opt-in grant like allow_shell.
+    assert srv.DEFAULT_ALLOW_EDITS is False
+
+
 # --------------------------------------------------------------------------- #
 # Binary discovery
 # --------------------------------------------------------------------------- #
@@ -182,7 +188,7 @@ def test_cli_command_prefix_runs_binary_directly(tmp_path: Path) -> None:
 def test_build_cli_args_default(workspace: Path) -> None:
     args = srv._build_cli_args(
         "do the thing", workspace,
-        allow_shell=False, read_only=False, timeout_seconds=120, model=None,
+        allow_shell=False, allow_edits=False, read_only=False, timeout_seconds=120, model=None,
     )
     assert args[:2] == ["-p", "do the thing"]
     assert "--add-dir" in args and str(workspace) in args
@@ -196,7 +202,7 @@ def test_build_cli_args_default(workspace: Path) -> None:
 def test_build_cli_args_read_only_uses_plan_mode(workspace: Path) -> None:
     args = srv._build_cli_args(
         "audit this", workspace,
-        allow_shell=False, read_only=True, timeout_seconds=60, model=None,
+        allow_shell=False, allow_edits=False, read_only=True, timeout_seconds=60, model=None,
     )
     assert args[args.index("--mode") + 1] == "plan"
 
@@ -204,15 +210,50 @@ def test_build_cli_args_read_only_uses_plan_mode(workspace: Path) -> None:
 def test_build_cli_args_allow_shell_skips_permissions(workspace: Path) -> None:
     args = srv._build_cli_args(
         "run tests", workspace,
-        allow_shell=True, read_only=False, timeout_seconds=60, model=None,
+        allow_shell=True, allow_edits=True, read_only=False, timeout_seconds=60, model=None,
     )
     assert "--dangerously-skip-permissions" in args
+
+
+def test_build_cli_args_allow_edits_uses_accept_edits_mode(workspace: Path) -> None:
+    # Without this, headless agy auto-denies write_file and the run is CANCELED
+    # having changed nothing.
+    args = srv._build_cli_args(
+        "write a file", workspace,
+        allow_shell=False, allow_edits=True, read_only=False, timeout_seconds=60, model=None,
+    )
+    assert args[args.index("--mode") + 1] == "accept-edits"
+    # The narrower grant must not quietly escalate to full permission bypass.
+    assert "--dangerously-skip-permissions" not in args
+
+
+def test_build_cli_args_allow_shell_omits_redundant_accept_edits(
+    workspace: Path,
+) -> None:
+    # --dangerously-skip-permissions already approves writes; passing both would
+    # be redundant argv noise.
+    args = srv._build_cli_args(
+        "run tests", workspace,
+        allow_shell=True, allow_edits=True, read_only=False, timeout_seconds=60, model=None,
+    )
+    assert "--mode" not in args
+
+
+def test_build_cli_args_read_only_beats_allow_edits(workspace: Path) -> None:
+    # Only one --mode can win, and plan mode is the one that keeps the promise
+    # of not touching the workspace.
+    args = srv._build_cli_args(
+        "audit", workspace,
+        allow_shell=False, allow_edits=True, read_only=True, timeout_seconds=60, model=None,
+    )
+    assert args[args.index("--mode") + 1] == "plan"
+    assert "accept-edits" not in args
 
 
 def test_build_cli_args_omits_conversation_by_default(workspace: Path) -> None:
     args = srv._build_cli_args(
         "x", workspace,
-        allow_shell=False, read_only=False, timeout_seconds=60, model=None,
+        allow_shell=False, allow_edits=False, read_only=False, timeout_seconds=60, model=None,
     )
     assert "--conversation" not in args
 
@@ -220,7 +261,7 @@ def test_build_cli_args_omits_conversation_by_default(workspace: Path) -> None:
 def test_build_cli_args_passes_conversation_id(workspace: Path) -> None:
     args = srv._build_cli_args(
         "x", workspace,
-        allow_shell=False, read_only=False, timeout_seconds=60, model=None,
+        allow_shell=False, allow_edits=False, read_only=False, timeout_seconds=60, model=None,
         conversation_id="abc-123",
     )
     assert args[args.index("--conversation") + 1] == "abc-123"
@@ -232,7 +273,7 @@ def test_build_cli_args_passes_conversation_id(workspace: Path) -> None:
 def test_build_cli_args_model_override(workspace: Path) -> None:
     args = srv._build_cli_args(
         "x", workspace,
-        allow_shell=False, read_only=False, timeout_seconds=60,
+        allow_shell=False, allow_edits=False, read_only=False, timeout_seconds=60,
         model="claude-sonnet-4-6",
     )
     assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
@@ -302,15 +343,17 @@ async def test_tool_is_registered_with_expected_schema() -> None:
         "task",
         "directory",
         "allow_shell",
+        "allow_edits",
         "read_only",
         "timeout_seconds",
         "model",
         "conversation_id",
     ):
         assert param in schema["properties"]
-    # allow_shell is nullable so an omitted value can fall back to the
-    # operator's ANTIGRAVITY_ALLOW_SHELL default; read_only stays a plain bool.
+    # allow_shell/allow_edits are nullable so an omitted value can fall back to
+    # the operator's ANTIGRAVITY_ALLOW_* default; read_only stays a plain bool.
     assert schema["properties"]["allow_shell"]["default"] is None
+    assert schema["properties"]["allow_edits"]["default"] is None
     assert schema["properties"]["read_only"]["default"] is False
     assert (tools[0].description or "").strip()
 
@@ -352,6 +395,59 @@ async def test_read_only_and_explicit_allow_shell_conflict(
         }
     )
     assert "contradictory" in message
+
+
+@pytest.mark.asyncio
+async def test_read_only_and_explicit_allow_edits_conflict(
+    workspace: Path, fake_agy
+) -> None:
+    message = await _call_expecting_error(
+        {
+            "task": "Audit this",
+            "directory": str(workspace),
+            "read_only": True,
+            "allow_edits": True,
+        }
+    )
+    assert "contradictory" in message
+
+
+@pytest.mark.asyncio
+async def test_allow_edits_reaches_the_subprocess(workspace: Path, fake_agy) -> None:
+    text = await _text(
+        {"task": "write a file", "directory": str(workspace), "allow_edits": True}
+    )
+    assert "accept-edits" in text
+    assert "--dangerously-skip-permissions" not in text
+
+
+@pytest.mark.asyncio
+async def test_edits_are_denied_by_default(workspace: Path, fake_agy) -> None:
+    # The shipped default writes nothing; callers must opt in per call.
+    text = await _text({"task": "x", "directory": str(workspace)})
+    assert "accept-edits" not in text
+
+
+@pytest.mark.asyncio
+async def test_env_default_enables_edits(
+    workspace: Path, fake_agy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(srv, "DEFAULT_ALLOW_EDITS", True)
+    text = await _text({"task": "x", "directory": str(workspace)})
+    assert "accept-edits" in text
+
+
+@pytest.mark.asyncio
+async def test_read_only_wins_over_edits_env_default(
+    workspace: Path, fake_agy, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Same regression guard as the shell default: an operator opting into edits
+    # must not turn every read_only call into an error.
+    monkeypatch.setattr(srv, "DEFAULT_ALLOW_EDITS", True)
+    text = await _text(
+        {"task": "audit", "directory": str(workspace), "read_only": True}
+    )
+    assert "plan" in text and "accept-edits" not in text
 
 
 @pytest.mark.asyncio
