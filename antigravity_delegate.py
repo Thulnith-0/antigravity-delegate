@@ -84,6 +84,12 @@ CLI_SUBPROCESS_TIMEOUT_BUFFER = _env_int("ANTIGRAVITY_CLI_TIMEOUT_BUFFER_SECONDS
 # Overridable, and not the only lookup path -- see _find_cli_binary.
 WINDOWS_DEFAULT_CLI_PATH = Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"
 
+# Accepted --effort values. Taken from the binary's own rejection message rather
+# than its --help text: agy 1.1.24 documented only low|medium|high, but 1.3.3
+# accepts five. Validating against the shorter list would reject values the CLI
+# supports, so this is read from what the CLI actually enforces.
+VALID_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
 
 # --------------------------------------------------------------------------- #
 # Validation helpers
@@ -126,6 +132,90 @@ def _validate_timeout(timeout_seconds: int) -> int:
     return timeout_seconds
 
 
+def _validate_effort(effort: str | None) -> str | None:
+    """Checks `effort` against the levels the CLI accepts."""
+    if effort is None:
+        return None
+    normalised = effort.strip().lower()
+    if normalised not in VALID_EFFORT_LEVELS:
+        raise ToolError(
+            f"`effort` must be one of {', '.join(VALID_EFFORT_LEVELS)}; "
+            f"got {effort!r}."
+        )
+    return normalised
+
+
+def _resolve_extra_dirs(extra_dirs: list[str] | None) -> list[Path]:
+    """Validates additional workspace directories and returns absolute paths."""
+    if not extra_dirs:
+        return []
+
+    resolved: list[Path] = []
+    for entry in extra_dirs:
+        if not entry or not entry.strip():
+            raise ToolError(
+                "`extra_dirs` contains an empty path. Remove it, or pass the "
+                "absolute path of a directory that exists."
+            )
+        path = Path(entry.strip()).expanduser()
+        try:
+            candidate = path.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ToolError(
+                f"`extra_dirs` entry {entry!r} could not be resolved: {exc}. "
+                "Each entry must be an absolute path to a directory that "
+                "already exists."
+            ) from exc
+        if not candidate.is_dir():
+            raise ToolError(
+                f"`extra_dirs` entry {str(candidate)!r} is a file, not a "
+                "directory. Pass the containing folder instead."
+            )
+        if candidate not in resolved:
+            resolved.append(candidate)
+    return resolved
+
+
+def _resolve_json_schema(json_schema: str | None) -> str | None:
+    """Accepts either an inline JSON schema or a path to a schema file.
+
+    The CLI takes both forms in the same argument, so this only has to decide
+    which one it was given and reject anything that is neither. Inline JSON is
+    checked first: a filesystem path is not valid JSON, so there is no ambiguity
+    in practice.
+    """
+    if json_schema is None:
+        return None
+
+    value = json_schema.strip()
+    if not value:
+        raise ToolError(
+            "`json_schema` is empty. Pass an inline JSON schema, a path to a "
+            "schema file, or omit the parameter."
+        )
+
+    try:
+        json.loads(value)
+    except (json.JSONDecodeError, ValueError):
+        pass
+    else:
+        return value
+
+    path = Path(value).expanduser()
+    try:
+        candidate = path.resolve(strict=True)
+    except (OSError, RuntimeError):
+        candidate = None
+
+    if candidate is not None and candidate.is_file():
+        return str(candidate)
+
+    raise ToolError(
+        f"`json_schema` is neither valid JSON nor an existing file: {value!r}. "
+        "Pass an inline JSON schema string, or the path to a .json schema file."
+    )
+
+
 # --------------------------------------------------------------------------- #
 # CLI invocation
 #
@@ -149,6 +239,13 @@ def _validate_timeout(timeout_seconds: int) -> int:
 #     confines the agent. Under --dangerously-skip-permissions the denial becomes
 #     approval: verified that agy then reads and writes paths entirely outside
 #     --add-dir. So allow_shell=True means no file confinement at all.
+#   * READING named files inside --add-dir needs NO permission grant, including
+#     images: verified against agy 1.3.3 that a plain delegation transcribed
+#     text out of a .png with no flags beyond the defaults. What fails is
+#     ENUMERATING a directory ("every .png in here"), because the agent reaches
+#     for a shell to list it and the command permission is auto-denied. Naming
+#     the files in the task avoids that entirely, so vision and bulk extraction
+#     work in the most confined mode. See the README security model.
 # --------------------------------------------------------------------------- #
 
 
@@ -201,10 +298,19 @@ def _build_cli_args(
     timeout_seconds: int,
     model: str | None,
     conversation_id: str | None = None,
+    effort: str | None = None,
+    extra_dirs: list[Path] | None = None,
+    json_schema: str | None = None,
 ) -> list[str]:
     args = [
-        "-p",
-        task,
+        # The prompt is attached to the flag rather than passed as the next
+        # argv element. With `--print <task>` the CLI takes whatever follows as
+        # the prompt, so a flag appearing there would be swallowed instead:
+        # `--print --effort high 'prompt'` sets the prompt to "--effort" and
+        # silently drops the real one. agy 1.3.3 detects that case and errors,
+        # but attaching the value makes it structurally impossible regardless of
+        # how the remaining flags are ordered.
+        f"--print={task}",
         "--add-dir",
         str(workspace),
         "--output-format",
@@ -215,6 +321,14 @@ def _build_cli_args(
         # keyboard; it should never be reinterpreted as a slash command.
         "--disable-slash-commands",
     ]
+    for extra in extra_dirs or []:
+        # --add-dir is repeatable; each extra directory joins the workspace
+        # without widening `directory` itself.
+        args += ["--add-dir", str(extra)]
+    if effort:
+        args += ["--effort", effort]
+    if json_schema:
+        args += ["--json-schema", json_schema]
     if conversation_id:
         # Explicit id rather than agy's --continue ("most recent"), which would
         # be racy when delegations run concurrently.
@@ -243,6 +357,12 @@ class DelegationResult:
     raw_stderr: str = ""
     parse_error: str | None = None
     conversation_id: str | None = None
+    # Present when json_schema was supplied: the CLI returns the schema-conformant
+    # object already parsed, which is more reliable than re-parsing the prose.
+    structured_output: object | None = None
+    # The CLI reports auto-denied permissions as structured data as well as in
+    # stderr prose. Preferred for diagnosing a CANCELED run.
+    denied_actions: list[dict] | None = None
 
 
 async def _run_delegation(
@@ -255,6 +375,9 @@ async def _run_delegation(
     timeout_seconds: int,
     model: str | None,
     conversation_id: str | None = None,
+    effort: str | None = None,
+    extra_dirs: list[Path] | None = None,
+    json_schema: str | None = None,
 ) -> DelegationResult:
     binary = _find_cli_binary()
     command = _cli_command_prefix(binary) + _build_cli_args(
@@ -266,6 +389,9 @@ async def _run_delegation(
         timeout_seconds=timeout_seconds,
         model=model,
         conversation_id=conversation_id,
+        effort=effort,
+        extra_dirs=extra_dirs,
+        json_schema=json_schema,
     )
 
     started = time.monotonic()
@@ -317,6 +443,7 @@ async def _run_delegation(
     if not text:
         text = "(agy finished without a response; see status/diagnostics below)"
 
+    denied = payload.get("denied_actions")
     return DelegationResult(
         text=text,
         elapsed_seconds=elapsed,
@@ -324,13 +451,26 @@ async def _run_delegation(
         usage=payload.get("usage"),
         raw_stderr=stderr,
         conversation_id=payload.get("conversation_id"),
+        structured_output=payload.get("structured_output"),
+        denied_actions=denied if isinstance(denied, list) and denied else None,
     )
 
 
 def _format_result(result: DelegationResult, workspace: Path) -> str:
     """Renders the result for the calling agent: answer first, evidence after."""
-    lines = [
-        result.text,
+    lines = [result.text]
+
+    if result.structured_output is not None:
+        # The caller supplied a json_schema, so the validated object is the
+        # actual deliverable. Emit it verbatim rather than making the caller
+        # re-parse it out of the prose above.
+        try:
+            rendered = json.dumps(result.structured_output, indent=2)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            rendered = repr(result.structured_output)
+        lines += ["", "Structured output:", "```json", rendered, "```"]
+
+    lines += [
         "",
         "---",
         f"_Antigravity sub-agent - `{workspace}` - {result.elapsed_seconds:.1f}s_",
@@ -360,20 +500,32 @@ def _format_result(result: DelegationResult, workspace: Path) -> str:
         suffix = "..." if len(result.raw_stderr) > 400 else ""
         lines.append(f"_agy diagnostics: {snippet}{suffix}_")
 
-        # The auto-denied-permission message names the tool but not the flag
-        # that would have allowed it, which makes an empty CANCELED run look
-        # inexplicable. Name the fix instead of leaving the caller to guess.
-        if "write_file" in result.raw_stderr and "permission" in result.raw_stderr:
-            lines.append(
-                "_Nothing was written: this run had no edit permission. Retry "
-                "with `allow_edits=true` to let the sub-agent write files._"
-            )
-        elif '"command" permission' in result.raw_stderr:
-            lines.append(
-                "_This task needed a shell command, which is denied by default. "
-                "Retry with `allow_shell=true` only if running commands is "
-                "genuinely required._"
-            )
+    # An auto-denied permission names the tool but not the flag that would have
+    # allowed it, which makes an empty CANCELED run look inexplicable. Name the
+    # fix instead of leaving the caller to guess. Prefer the structured
+    # denied_actions field; fall back to the stderr prose, which is all older
+    # CLI versions provide.
+    denied_names = {
+        str(entry.get("action", "")).lower()
+        for entry in (result.denied_actions or [])
+        if isinstance(entry, dict)
+    }
+    stderr_text = result.raw_stderr or ""
+    if "write_file" in denied_names or (
+        "write_file" in stderr_text and "permission" in stderr_text
+    ):
+        lines.append(
+            "_Nothing was written: this run had no edit permission. Retry "
+            "with `allow_edits=true` to let the sub-agent write files._"
+        )
+    elif "command" in denied_names or '"command" permission' in stderr_text:
+        lines.append(
+            "_This task needed a shell command, which is denied by default. "
+            "Most often that is directory enumeration: naming the files "
+            "explicitly in the task avoids it entirely and needs no extra "
+            "permission. Otherwise retry with `allow_shell=true`, but only if "
+            "running commands is genuinely required._"
+        )
 
     if result.status and result.status != "SUCCESS":
         lines.insert(
@@ -423,6 +575,9 @@ async def delegate_to_antigravity(
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
     model: str | None = DEFAULT_MODEL,
     conversation_id: str | None = None,
+    effort: str | None = None,
+    extra_dirs: list[str] | None = None,
+    json_schema: str | None = None,
 ) -> str:
     """Delegate a self-contained coding or research task to a Google Antigravity sub-agent.
 
@@ -478,10 +633,25 @@ async def delegate_to_antigravity(
             Use this for CONTINUITY, not to save tokens -- measured, resuming
             can cost either more or less than a fresh run depending on the task.
             Omit it for independent tasks.
+        effort: Reasoning effort for this run: "low", "medium", "high",
+            "xhigh" or "max". Omitted leaves the account default untouched.
+            "low" is markedly cheaper and is usually enough for mechanical work
+            such as transcription, renaming, or applying a stated pattern.
+        extra_dirs: Additional absolute directory paths to add to the
+            workspace, one `--add-dir` each. Use this when inputs and outputs
+            live in different trees, instead of widening `directory` to a
+            common ancestor. Each must already exist. Subject to the same
+            permission rules as `directory`.
+        json_schema: Either an inline JSON schema string or a path to a .json
+            schema file, constraining the sub-agent's final answer. When set,
+            the validated object is returned verbatim under "Structured
+            output", which is more reliable than re-parsing prose. Useful for
+            bulk extraction work such as transcription, where you want rows
+            rather than a narrative.
 
     Returns:
-        agy's final answer, then token usage, the conversation_id for chaining,
-        and any diagnostics.
+        agy's final answer, the validated object when `json_schema` was used,
+        then token usage, the conversation_id for chaining, and any diagnostics.
     """
     if not task or not task.strip():
         raise ToolError(
@@ -519,14 +689,21 @@ async def delegate_to_antigravity(
 
     workspace = _resolve_workspace(directory)
     timeout = _validate_timeout(timeout_seconds)
+    chosen_effort = _validate_effort(effort)
+    resolved_extra_dirs = _resolve_extra_dirs(extra_dirs)
+    resolved_schema = _resolve_json_schema(json_schema)
 
     logger.info(
-        "Delegating to agy in %s (shell=%s, edits=%s, read_only=%s, timeout=%ss)",
+        "Delegating to agy in %s (shell=%s, edits=%s, read_only=%s, timeout=%ss, "
+        "effort=%s, extra_dirs=%d, json_schema=%s)",
         workspace,
         allow_shell,
         allow_edits,
         read_only,
         timeout,
+        chosen_effort or "default",
+        len(resolved_extra_dirs),
+        bool(resolved_schema),
     )
 
     try:
@@ -539,6 +716,9 @@ async def delegate_to_antigravity(
             timeout_seconds=timeout,
             model=model,
             conversation_id=conversation_id,
+            effort=chosen_effort,
+            extra_dirs=resolved_extra_dirs,
+            json_schema=resolved_schema,
         )
     except ToolError:
         raise

@@ -177,6 +177,33 @@ The installation procedure above has been verified from a clean `git clone`:
 clone, virtual environment creation, dependency installation, module import, and
 the full test suite all complete successfully.
 
+### Optional: confirm image reading
+
+The automated test suite never calls the real CLI, so it cannot confirm that a
+delegated sub-agent can read text out of an image. If you intend to delegate
+transcription or any other vision work, verify it once manually. This consumes
+roughly 20,000 account tokens.
+
+Generate a test image with known contents:
+
+```bash
+pip install Pillow
+```
+
+```bash
+python -c "from PIL import Image, ImageDraw; i=Image.new('RGB',(700,120),'white'); ImageDraw.Draw(i).text((20,40),'Ledger entry 47: sold 12 crates of saffron',fill='black'); i.save('ledger.png')"
+```
+
+Then ask Claude Code to delegate reading it, from the directory containing the
+image:
+
+> Use delegate_to_antigravity on this directory to read ledger.png and transcribe the text in it. Name the file explicitly and do not enable allow_shell.
+
+The returned transcription should match the text written into the image. A
+`command` permission diagnostic instead means the sub-agent tried to search the
+directory rather than read the named file; see
+[Reading files needs no permission grant](#reading-files-needs-no-permission-grant).
+
 ## Usage
 
 Claude Code invokes the tool automatically when delegation is appropriate. It can
@@ -217,6 +244,31 @@ Review returned output before accepting it. Treat a delegated result as a pull
 request from an external contributor: generally sound, occasionally incorrect
 with high confidence.
 
+### Bulk extraction and transcription
+
+Reading files, images included, needs no permission grant, so extraction work
+runs in the most confined mode. The following combination is verified working:
+
+- Name every target file in the task, by absolute path, and instruct the
+  sub-agent not to list or search directories. Enumeration is the only part of
+  this workload that requires a shell, and the parent agent can enumerate the
+  directory itself for a negligible cost. See
+  [Reading files needs no permission grant](#reading-files-needs-no-permission-grant).
+- Supply `json_schema` so the result comes back as validated rows rather than
+  prose that has to be re-parsed.
+- Use `extra_dirs` when the output directory is outside the input tree, rather
+  than setting `directory` to a common ancestor.
+- Set `effort` to `low`. Transcription is mechanical and does not benefit from
+  extended reasoning.
+- Leave `allow_edits` and `allow_shell` off.
+
+Measured on three images with an inline schema: 12,356 tokens in 40 seconds,
+returning a validated object, with no permission grants.
+
+Batch by a handful of files per call rather than hundreds. A single call holds
+every result in one response, and large batches are more likely to exceed the
+timeout.
+
 ## Tool reference
 
 ### `delegate_to_antigravity`
@@ -231,6 +283,9 @@ with high confidence.
 | `timeout_seconds` | integer | `900` | Abort the run after the specified duration. Maximum 3600. |
 | `model` | string | account default | Model override. Run `agy models` for valid identifiers. |
 | `conversation_id` | string | none | Resume the context of a previous run. |
+| `effort` | string | account default | Reasoning effort: `low`, `medium`, `high`, `xhigh` or `max`. Omitted leaves the account default unchanged. `low` is markedly cheaper and is usually sufficient for mechanical work. |
+| `extra_dirs` | array of strings | empty | Additional absolute directory paths added to the workspace, one `--add-dir` each. Use when inputs and outputs live in separate trees, rather than widening `directory` to a common ancestor. Each must already exist, and each is subject to the same permission rules as `directory`. |
+| `json_schema` | string | none | An inline JSON schema, or a path to a `.json` schema file, constraining the final answer. The validated object is returned under a `Structured output` heading. |
 
 The tool returns the sub-agent's final response, followed by elapsed time, token
 usage, the `conversation_id` for subsequent chaining, and any diagnostic output.
@@ -281,6 +336,35 @@ useful for reading, research and reporting, but cannot complete editing work.
 A task that requires a denied permission is cancelled in its entirety rather than
 completing partially. No output is produced, and tokens consumed up to that point
 are not recovered.
+
+#### Reading files needs no permission grant
+
+Reading a named file inside the workspace requires no parameter and no
+configuration, and this includes images. Verified against 1.3.3: a delegation in
+the default mode transcribed handwritten text out of a `.png` correctly, with no
+permission flags set.
+
+What fails is asking the sub-agent to *enumerate* a directory, for example
+"transcribe every .png in this folder". Enumeration requires a shell command, the
+`command` permission is denied in headless mode, and the run is cancelled. The
+denial is reported as a `command` denial, which can be mistaken for a file-access
+problem; it is not.
+
+The fix does not involve widening permissions. Name the target files in the task,
+preferably by absolute path, and instruct the sub-agent not to search. The parent
+agent can enumerate the directory itself far more cheaply than the sub-agent can.
+
+This is worth stating explicitly because the obvious workaround is wrong.
+Granting `allow_shell` to make enumeration succeed exchanges a confined,
+read-only task for unrestricted filesystem access, when the task never needed
+write or shell access in the first place.
+
+A `permissions.allow` entry in `~/.gemini/antigravity-cli/settings.json` can
+grant `read_file(<path>)` recursively, but it is unnecessary for this case, since
+reads are already permitted. That file is also global user configuration shared
+by every CLI invocation, so this server does not write to it: doing so per
+delegation would race against concurrent runs and modify state outside the
+workspace.
 
 ### Edit mode (`allow_edits` enabled)
 

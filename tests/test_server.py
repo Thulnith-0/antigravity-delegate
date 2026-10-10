@@ -190,13 +190,210 @@ def test_build_cli_args_default(workspace: Path) -> None:
         "do the thing", workspace,
         allow_shell=False, allow_edits=False, read_only=False, timeout_seconds=120, model=None,
     )
-    assert args[:2] == ["-p", "do the thing"]
+    assert args[0] == "--print=do the thing"
     assert "--add-dir" in args and str(workspace) in args
     assert "--output-format" in args and "json" in args
     assert "--print-timeout" in args and "120s" in args
     assert "--disable-slash-commands" in args
     assert "--mode" not in args
     assert "--dangerously-skip-permissions" not in args
+    assert "--effort" not in args
+    assert "--json-schema" not in args
+
+
+# --------------------------------------------------------------------------- #
+# Prompt/flag argv ordering
+#
+# Regression guard for a real CLI trap: with `--print <task>` as two argv
+# elements, the CLI takes whatever follows --print as the prompt, so
+# `--print --effort high 'prompt'` sets the prompt to "--effort" and silently
+# drops the real one. Attaching the prompt to the flag makes that impossible
+# no matter how the remaining flags are ordered.
+# --------------------------------------------------------------------------- #
+
+
+def test_prompt_is_attached_to_the_print_flag(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "do the thing", workspace,
+        allow_shell=False, allow_edits=False, read_only=False,
+        timeout_seconds=60, model=None,
+    )
+    assert args[0] == "--print=do the thing"
+    # The bare separated forms must not appear at all, since either would
+    # reintroduce the swallow trap.
+    assert "-p" not in args
+    assert "--print" not in args
+
+
+def test_no_flag_can_be_swallowed_as_the_prompt(workspace: Path) -> None:
+    """Every flag-shaped element must be a real flag, never a prompt value."""
+    args = srv._build_cli_args(
+        "transcribe the images", workspace,
+        allow_shell=False, allow_edits=False, read_only=False,
+        timeout_seconds=60, model="gemini-3.1-pro-high",
+        effort="high",
+        extra_dirs=[workspace],
+        json_schema='{"type":"object"}',
+    )
+    # The prompt is self-contained in argv[0], so no later element is at risk
+    # of being consumed as it.
+    assert args[0].startswith("--print=")
+    assert "transcribe the images" not in args[1:]
+    # --effort must be followed by its value, not by another flag.
+    assert args[args.index("--effort") + 1] == "high"
+
+
+def test_effort_survives_every_flag_combination(workspace: Path) -> None:
+    for allow_shell, allow_edits, read_only in [
+        (False, False, False),
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+    ]:
+        args = srv._build_cli_args(
+            "x", workspace,
+            allow_shell=allow_shell, allow_edits=allow_edits, read_only=read_only,
+            timeout_seconds=60, model=None, effort="max",
+        )
+        assert args[args.index("--effort") + 1] == "max", (
+            allow_shell, allow_edits, read_only
+        )
+
+
+# --------------------------------------------------------------------------- #
+# effort
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("level", srv.VALID_EFFORT_LEVELS)
+def test_effort_accepts_every_level_the_cli_supports(level: str) -> None:
+    # agy 1.1.24's --help listed only low|medium|high, but 1.3.3 accepts five.
+    # Validating against the shorter list would reject working values.
+    assert srv._validate_effort(level) == level
+
+
+def test_effort_normalises_case_and_whitespace() -> None:
+    assert srv._validate_effort("  HIGH ") == "high"
+
+
+def test_effort_none_is_passed_through() -> None:
+    assert srv._validate_effort(None) is None
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "medium-high", "turbo", "0"])
+def test_effort_rejects_invalid_values(bad: str) -> None:
+    with pytest.raises(ToolError, match="`effort` must be one of"):
+        srv._validate_effort(bad)
+
+
+def test_build_cli_args_omits_effort_when_unset(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "x", workspace,
+        allow_shell=False, allow_edits=False, read_only=False,
+        timeout_seconds=60, model=None, effort=None,
+    )
+    assert "--effort" not in args
+
+
+# --------------------------------------------------------------------------- #
+# extra_dirs
+# --------------------------------------------------------------------------- #
+
+
+def test_extra_dirs_defaults_to_empty() -> None:
+    assert srv._resolve_extra_dirs(None) == []
+    assert srv._resolve_extra_dirs([]) == []
+
+
+def test_extra_dirs_resolves_existing_directories(tmp_path: Path) -> None:
+    a = tmp_path / "images"
+    b = tmp_path / "out"
+    a.mkdir()
+    b.mkdir()
+    assert srv._resolve_extra_dirs([str(a), str(b)]) == [a.resolve(), b.resolve()]
+
+
+def test_extra_dirs_deduplicates(tmp_path: Path) -> None:
+    d = tmp_path / "images"
+    d.mkdir()
+    assert srv._resolve_extra_dirs([str(d), str(d)]) == [d.resolve()]
+
+
+def test_extra_dirs_rejects_missing_directory(tmp_path: Path) -> None:
+    with pytest.raises(ToolError, match="could not be resolved"):
+        srv._resolve_extra_dirs([str(tmp_path / "nope")])
+
+
+def test_extra_dirs_rejects_a_file(tmp_path: Path) -> None:
+    f = tmp_path / "ledger.png"
+    f.write_bytes(b"x")
+    with pytest.raises(ToolError, match="is a file, not a"):
+        srv._resolve_extra_dirs([str(f)])
+
+
+@pytest.mark.parametrize("bad", ["", "   "])
+def test_extra_dirs_rejects_blank_entry(bad: str) -> None:
+    with pytest.raises(ToolError, match="empty path"):
+        srv._resolve_extra_dirs([bad])
+
+
+def test_build_cli_args_emits_one_add_dir_per_extra(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    imgs = tmp_path / "images"
+    out = tmp_path / "out"
+    for d in (ws, imgs, out):
+        d.mkdir()
+    args = srv._build_cli_args(
+        "x", ws,
+        allow_shell=False, allow_edits=False, read_only=False,
+        timeout_seconds=60, model=None, extra_dirs=[imgs, out],
+    )
+    pairs = [(args[i], args[i + 1]) for i, a in enumerate(args) if a == "--add-dir"]
+    assert pairs == [
+        ("--add-dir", str(ws)),
+        ("--add-dir", str(imgs)),
+        ("--add-dir", str(out)),
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# json_schema
+# --------------------------------------------------------------------------- #
+
+
+def test_json_schema_accepts_inline_json() -> None:
+    inline = '{"type": "object", "properties": {"a": {"type": "string"}}}'
+    assert srv._resolve_json_schema(inline) == inline
+
+
+def test_json_schema_accepts_a_file_path(tmp_path: Path) -> None:
+    p = tmp_path / "schema.json"
+    p.write_text('{"type": "object"}', encoding="utf-8")
+    assert srv._resolve_json_schema(str(p)) == str(p.resolve())
+
+
+def test_json_schema_none_is_passed_through() -> None:
+    assert srv._resolve_json_schema(None) is None
+
+
+def test_json_schema_rejects_empty() -> None:
+    with pytest.raises(ToolError, match="`json_schema` is empty"):
+        srv._resolve_json_schema("   ")
+
+
+@pytest.mark.parametrize("bad", ["{not json", "schema.json", "/no/such/file.json"])
+def test_json_schema_rejects_neither_json_nor_file(bad: str) -> None:
+    with pytest.raises(ToolError, match="neither valid JSON nor an existing file"):
+        srv._resolve_json_schema(bad)
+
+
+def test_build_cli_args_passes_json_schema(workspace: Path) -> None:
+    args = srv._build_cli_args(
+        "x", workspace,
+        allow_shell=False, allow_edits=False, read_only=False,
+        timeout_seconds=60, model=None, json_schema='{"type":"object"}',
+    )
+    assert args[args.index("--json-schema") + 1] == '{"type":"object"}'
 
 
 def test_build_cli_args_read_only_uses_plan_mode(workspace: Path) -> None:
@@ -348,6 +545,9 @@ async def test_tool_is_registered_with_expected_schema() -> None:
         "timeout_seconds",
         "model",
         "conversation_id",
+        "effort",
+        "extra_dirs",
+        "json_schema",
     ):
         assert param in schema["properties"]
     # allow_shell/allow_edits are nullable so an omitted value can fall back to
@@ -533,6 +733,91 @@ async def test_delegation_surfaces_shell_denied_diagnostics(
     text = await _text({"task": "run a command", "directory": str(workspace)})
     assert "finished without a response" in text
     assert "auto-denied" in text
+
+
+@pytest.mark.asyncio
+async def test_delegation_forwards_new_flags_to_agy(workspace: Path, fake_agy) -> None:
+    # The fake echoes argv, so this proves the parameters reach the subprocess
+    # rather than only being accepted by the tool signature.
+    text = await _text(
+        {
+            "task": "transcribe",
+            "directory": str(workspace),
+            "effort": "low",
+            "extra_dirs": [str(workspace)],
+            "json_schema": '{"type":"object"}',
+        }
+    )
+    assert "--effort" in text and "low" in text
+    assert "--json-schema" in text
+    assert text.count("--add-dir") >= 2
+
+
+@pytest.mark.asyncio
+async def test_delegation_rejects_bad_effort(workspace: Path, fake_agy) -> None:
+    message = await _call_expecting_error(
+        {"task": "x", "directory": str(workspace), "effort": "turbo"}
+    )
+    assert "`effort` must be one of" in message
+
+
+@pytest.mark.asyncio
+async def test_delegation_rejects_missing_extra_dir(
+    workspace: Path, fake_agy
+) -> None:
+    message = await _call_expecting_error(
+        {
+            "task": "x",
+            "directory": str(workspace),
+            "extra_dirs": [str(workspace / "nope")],
+        }
+    )
+    assert "could not be resolved" in message
+
+
+@pytest.mark.asyncio
+async def test_delegation_rejects_bad_json_schema(workspace: Path, fake_agy) -> None:
+    message = await _call_expecting_error(
+        {"task": "x", "directory": str(workspace), "json_schema": "{not json"}
+    )
+    assert "neither valid JSON nor an existing file" in message
+
+
+@pytest.mark.asyncio
+async def test_structured_output_is_surfaced_verbatim(
+    workspace: Path, fake_agy
+) -> None:
+    fake_agy("structured")
+    text = await _text({"task": "transcribe", "directory": str(workspace)})
+    assert "Structured output:" in text
+    assert '"entry_number": 47' in text
+    assert '"file": "ledger.png"' in text
+    # The prose response is still reported alongside it.
+    assert "Transcribed 1 entry." in text
+
+
+@pytest.mark.asyncio
+async def test_denied_command_hint_mentions_enumeration(
+    workspace: Path, fake_agy
+) -> None:
+    # Verified against the real CLI: reading named files needs no grant, so a
+    # command denial is usually directory enumeration. The hint should say so
+    # rather than only pointing at allow_shell.
+    fake_agy("shell_denied")
+    text = await _text({"task": "transcribe every png", "directory": str(workspace)})
+    assert "naming the files" in text.lower()
+    assert "allow_shell=true" in text
+
+
+@pytest.mark.asyncio
+async def test_denied_write_hint_comes_from_structured_field(
+    workspace: Path, fake_agy
+) -> None:
+    # write_denied emits denied_actions with no matching stderr prose, so this
+    # only passes if the structured field is being read.
+    fake_agy("write_denied")
+    text = await _text({"task": "write a file", "directory": str(workspace)})
+    assert "allow_edits=true" in text
 
 
 @pytest.mark.asyncio
