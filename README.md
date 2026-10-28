@@ -244,6 +244,37 @@ Review returned output before accepting it. Treat a delegated result as a pull
 request from an external contributor: generally sound, occasionally incorrect
 with high confidence.
 
+### Images
+
+Both directions work, and neither needs a permission parameter.
+
+**Reading.** Name the image file in the task and the sub-agent will describe or
+transcribe it. See
+[Reading files needs no permission grant](#reading-files-needs-no-permission-grant).
+
+**Generating.** Ask for an image in the task:
+
+> Use delegate_to_antigravity on ./assets to generate an image of a yellow rubber duck on a plain white background.
+
+Image requests are handed to a built-in `image-generator` subagent, which writes
+its output to the CLI's per-conversation artifact directory rather than to the
+workspace, under a filename it chooses, and not necessarily in the format that
+was asked for. The turn frequently ends while that subagent is still working, so
+the sub-agent's own reply may say only that generation was "dispatched" and may
+never name the file.
+
+This server therefore sweeps the conversation's artifact directory after each
+run for images created during it, copies them into `directory`, and lists their
+paths under a `Generated images` heading. That listing, rather than the
+sub-agent's prose, is the reliable record of what was produced.
+
+Measured: one image generated and delivered in 79 seconds for 15,883 tokens, in
+the default permission tier with `allow_edits` and `allow_shell` both off.
+
+Existing files are never overwritten; a name collision is given a numeric
+suffix. Under `read_only` nothing is copied, and the original artifact paths are
+reported instead.
+
 ### Bulk extraction and transcription
 
 Reading files, images included, needs no permission grant, so extraction work
@@ -286,6 +317,7 @@ timeout.
 | `effort` | string | account default | Reasoning effort: `low`, `medium`, `high`, `xhigh` or `max`. Omitted leaves the account default unchanged. `low` is markedly cheaper and is usually sufficient for mechanical work. |
 | `extra_dirs` | array of strings | empty | Additional absolute directory paths added to the workspace, one `--add-dir` each. Use when inputs and outputs live in separate trees, rather than widening `directory` to a common ancestor. Each must already exist, and each is subject to the same permission rules as `directory`. |
 | `json_schema` | string | none | An inline JSON schema, or a path to a `.json` schema file, constraining the final answer. The validated object is returned under a `Structured output` heading. |
+| `deliver_images` | boolean | `true` | Copy images the sub-agent generates into `directory` and report their paths. Set false to leave them in the CLI's artifact directory and report the original paths. Forced off under `read_only`. |
 
 The tool returns the sub-agent's final response, followed by elapsed time, token
 usage, the `conversation_id` for subsequent chaining, and any diagnostic output.
@@ -336,6 +368,22 @@ useful for reading, research and reporting, but cannot complete editing work.
 A task that requires a denied permission is cancelled in its entirety rather than
 completing partially. No output is produced, and tokens consumed up to that point
 are not recovered.
+
+#### Shell commands are classified by effect
+
+As of 1.4.5 the `command` permission is not refused uniformly. Verified with no
+`settings.json` present and no permission flags:
+
+| Command | Result |
+| --- | --- |
+| `git --version` | Executed |
+| `echo some-text` | Executed |
+| `echo text > proof.txt` | Denied, nothing written |
+| `mkdir newdir` | Denied, nothing created |
+
+Read-only commands run without configuration. Commands that modify the system
+are denied, exactly as before. Earlier versions denied all commands, so a task
+that failed on 1.3.3 may now partially succeed.
 
 #### Reading files needs no permission grant
 
@@ -399,6 +447,46 @@ answered from its contents. The same query in default mode correctly returned
 
 Consequently, information supplied to one delegation may surface in a later,
 unrelated delegation, including across different projects.
+
+### Granting specific commands without `allow_shell`
+
+`allow_shell` is all or nothing, and it removes directory confinement. For a
+workflow that needs a few known commands, a scoped allow-rule is a far narrower
+grant: the named commands run, everything else stays denied, and file
+confinement is preserved because `--dangerously-skip-permissions` is never
+passed.
+
+Rules live in `~/.gemini/antigravity-cli/settings.json`:
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "command(regex:npm run (build|test|lint))",
+      "command(regex:git .*)"
+    ]
+  }
+}
+```
+
+Verified on 1.4.5: with only `command(regex:echo .*)` allowed, a mutating
+`echo text > proof.txt` succeeded while `mkdir newdir` was still denied and no
+directory was created.
+
+Two caveats:
+
+- **On Windows, use the `regex:` form.** The documentation states that commands
+  which cannot be split cleanly into words require an exact match by default,
+  so `command(git)` is not reliable in PowerShell. `command(regex:git .*)` is.
+- **This file is global.** It applies to every CLI invocation on the machine,
+  not just delegations from this server. There is no documented project-scoped
+  settings file, no environment variable to relocate it, and no command-line
+  flag to supply rules for a single run. This server therefore never writes to
+  it: doing so per delegation would race against concurrent runs and mutate
+  state outside the workspace. Edit it yourself, deliberately, once.
+
+Prefer this to `allow_shell` whenever the set of required commands is known in
+advance.
 
 ### Recommendations
 
@@ -597,13 +685,21 @@ tests/
 
 ## Compatibility
 
-Behaviour documented here was verified on Windows against `agy` version 1.1.24.
-Continuous integration confirms the test suite passes on Linux, but live
-delegations have not been exercised on macOS or Linux.
+Behaviour documented here was verified on Windows against `agy` version 1.4.5.
+Sections describing permission behaviour note the version they were measured
+under, because it has changed more than once. Continuous integration confirms
+the test suite passes on Linux, but live delegations have not been exercised on
+macOS or Linux.
 
 The Antigravity CLI updates itself automatically, so its behaviour may diverge
-from what is documented here. If observed behaviour contradicts this document,
-please open an issue reporting the `agy` version in use.
+from what is documented here. Two changes observed so far illustrate the risk:
+file writes inside the workspace were approved automatically in 1.1.22 and
+denied from 1.1.24, and read-only shell commands were denied through 1.3.3 but
+execute without configuration in 1.4.5. Both were found by testing rather than
+from release notes.
+
+If observed behaviour contradicts this document, please open an issue reporting
+the `agy` version in use.
 
 ## License
 

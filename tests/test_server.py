@@ -8,6 +8,7 @@ credentials and no Antigravity install.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -818,6 +819,167 @@ async def test_denied_write_hint_comes_from_structured_field(
     fake_agy("write_denied")
     text = await _text({"task": "write a file", "directory": str(workspace)})
     assert "allow_edits=true" in text
+
+
+# --------------------------------------------------------------------------- #
+# Generated images
+#
+# The image-generator subagent writes to the conversation's artifact directory,
+# not the workspace, under a name it chooses, and the turn often ends before it
+# finishes so the response does not name the file. Without the sweep the caller
+# is told an image exists but cannot find it.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def fake_state_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    state = tmp_path / "cli-state"
+    state.mkdir()
+    monkeypatch.setenv("ANTIGRAVITY_STATE_DIR", str(state))
+    monkeypatch.setattr(srv, "ANTIGRAVITY_STATE_DIR", state)
+    return state
+
+
+def _write_image(conv_dir: Path, name: str, when: float | None = None) -> Path:
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    p = conv_dir / name
+    p.write_bytes(b"\xff\xd8\xff\xe0 fake")
+    if when is not None:
+        os.utime(p, (when, when))
+    return p
+
+
+def test_collect_images_returns_nothing_without_conversation_id(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    assert srv._collect_generated_images(
+        None, 0.0, workspace, copy_into_workspace=False
+    ) == []
+
+
+def test_collect_images_handles_missing_conversation_dir(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    assert srv._collect_generated_images(
+        "no-such-conv", 0.0, workspace, copy_into_workspace=False
+    ) == []
+
+
+def test_collect_images_finds_new_image(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    conv = fake_state_dir / "brain" / "c1"
+    img = _write_image(conv, "leaf.jpg")
+    found = srv._collect_generated_images(
+        "c1", 0.0, workspace, copy_into_workspace=False
+    )
+    assert found == [img]
+
+
+def test_collect_images_ignores_pre_existing_images(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    # A resumed conversation must not re-report images from earlier turns.
+    conv = fake_state_dir / "brain" / "c1"
+    _write_image(conv, "old.jpg", when=1000.0)
+    found = srv._collect_generated_images(
+        "c1", 5000.0, workspace, copy_into_workspace=False
+    )
+    assert found == []
+
+
+def test_collect_images_ignores_system_generated_logs(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    conv = fake_state_dir / "brain" / "c1"
+    _write_image(conv / ".system_generated" / "logs", "preview.png")
+    keeper = _write_image(conv, "real.jpg")
+    found = srv._collect_generated_images(
+        "c1", 0.0, workspace, copy_into_workspace=False
+    )
+    assert found == [keeper]
+
+
+def test_collect_images_ignores_non_image_files(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    conv = fake_state_dir / "brain" / "c1"
+    conv.mkdir(parents=True)
+    (conv / "notes.txt").write_text("not an image", encoding="utf-8")
+    assert srv._collect_generated_images(
+        "c1", 0.0, workspace, copy_into_workspace=False
+    ) == []
+
+
+def test_collect_images_copies_into_workspace(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    conv = fake_state_dir / "brain" / "c1"
+    _write_image(conv, "leaf.jpg")
+    found = srv._collect_generated_images(
+        "c1", 0.0, workspace, copy_into_workspace=True
+    )
+    assert found == [workspace / "leaf.jpg"]
+    assert (workspace / "leaf.jpg").is_file()
+
+
+def test_collect_images_never_overwrites_existing_workspace_file(
+    workspace: Path, fake_state_dir: Path
+) -> None:
+    existing = workspace / "leaf.jpg"
+    existing.write_bytes(b"do not clobber me")
+    conv = fake_state_dir / "brain" / "c1"
+    _write_image(conv, "leaf.jpg")
+    found = srv._collect_generated_images(
+        "c1", 0.0, workspace, copy_into_workspace=True
+    )
+    assert found != [existing]
+    assert existing.read_bytes() == b"do not clobber me"
+    assert found[0].is_file()
+
+
+@pytest.mark.asyncio
+async def test_generated_images_are_reported_to_the_caller(
+    workspace: Path, fake_agy, fake_state_dir: Path
+) -> None:
+    fake_agy("generates_image")
+    text = await _text({"task": "generate a leaf", "directory": str(workspace)})
+    assert "Generated images (1):" in text
+    assert "leaf_1793200712459.jpg" in text
+    # Delivered into the workspace by default, so the caller can open it.
+    assert (workspace / "leaf_1793200712459.jpg").is_file()
+    # The log image under .system_generated must not be reported.
+    assert "preview.png" not in text
+
+
+@pytest.mark.asyncio
+async def test_deliver_images_false_leaves_them_in_place(
+    workspace: Path, fake_agy, fake_state_dir: Path
+) -> None:
+    fake_agy("generates_image")
+    text = await _text(
+        {
+            "task": "generate a leaf",
+            "directory": str(workspace),
+            "deliver_images": False,
+        }
+    )
+    assert "Generated images (1):" in text
+    assert not (workspace / "leaf_1793200712459.jpg").exists()
+
+
+@pytest.mark.asyncio
+async def test_read_only_never_delivers_images_into_the_workspace(
+    workspace: Path, fake_agy, fake_state_dir: Path
+) -> None:
+    # Plan mode promises an unmodified workspace; delivery would break that
+    # even though the caller left deliver_images at its default.
+    fake_agy("generates_image")
+    text = await _text(
+        {"task": "plan something", "directory": str(workspace), "read_only": True}
+    )
+    assert "Generated images (1):" in text
+    assert not (workspace / "leaf_1793200712459.jpg").exists()
 
 
 @pytest.mark.asyncio

@@ -63,6 +63,32 @@ def main() -> int:
         sys.stdout.write(json.dumps(payload))
         return 0
 
+    if behavior == "generates_image":
+        # Mirrors the real CLI: the image-generator subagent writes into the
+        # conversation's artifact directory under a name of its own choosing,
+        # and the turn can end before it finishes, so the response does not
+        # name the file.
+        state = os.environ.get("ANTIGRAVITY_STATE_DIR")
+        if state:
+            conv = os.path.join(state, "brain", "fake-conv-id")
+            os.makedirs(os.path.join(conv, ".system_generated", "logs"), exist_ok=True)
+            with open(os.path.join(conv, "leaf_1793200712459.jpg"), "wb") as fh:
+                fh.write(b"\xff\xd8\xff\xe0 fake jpeg bytes")
+            # A log file that must NOT be reported as a deliverable.
+            with open(
+                os.path.join(conv, ".system_generated", "logs", "preview.png"), "wb"
+            ) as fh:
+                fh.write(b"\x89PNG fake")
+        payload = {
+            "conversation_id": "fake-conv-id",
+            "status": "SUCCESS",
+            "response": "I have dispatched the task to the image generation subagent.",
+            "duration_seconds": 0.01,
+            "usage": {"input_tokens": 42, "output_tokens": 7, "total_tokens": 49},
+        }
+        sys.stdout.write(json.dumps(payload))
+        return 0
+
     if behavior == "structured":
         # What agy returns when --json-schema is supplied: the validated object
         # under structured_output, in addition to the prose response.
