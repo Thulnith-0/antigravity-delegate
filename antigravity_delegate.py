@@ -21,7 +21,7 @@ import os
 import shutil
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -83,6 +83,18 @@ CLI_SUBPROCESS_TIMEOUT_BUFFER = _env_int("ANTIGRAVITY_CLI_TIMEOUT_BUFFER_SECONDS
 # Default install location of the Windows installer (antigravity.google/cli).
 # Overridable, and not the only lookup path -- see _find_cli_binary.
 WINDOWS_DEFAULT_CLI_PATH = Path.home() / "AppData" / "Local" / "agy" / "bin" / "agy.exe"
+
+# Where the CLI keeps per-conversation state. Generated images are written to
+# brain/<conversation-id>/ rather than to the workspace, so this is the only
+# place they can be found afterwards. Overridable mainly so tests can point it
+# at a temporary directory.
+ANTIGRAVITY_STATE_DIR = Path(
+    os.environ.get("ANTIGRAVITY_STATE_DIR")
+    or (Path.home() / ".gemini" / "antigravity-cli")
+)
+
+# Suffixes treated as generated images when sweeping the conversation directory.
+IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff")
 
 # Accepted --effort values. Taken from the binary's own rejection message rather
 # than its --help text: agy 1.1.24 documented only low|medium|high, but 1.3.3
@@ -346,6 +358,72 @@ def _build_cli_args(
     return args
 
 
+def _collect_generated_images(
+    conversation_id: str | None,
+    started_at: float,
+    workspace: Path,
+    *,
+    copy_into_workspace: bool,
+) -> list[Path]:
+    """Finds images the run produced and optionally copies them into `workspace`.
+
+    Image generation runs as a built-in subagent that saves its output to the
+    conversation's artifact directory, not to the workspace, under a name it
+    chooses (and not necessarily the extension that was asked for). The final
+    response often does not name the file either, because the turn can end
+    while the subagent is still finishing. Without this sweep a caller is told
+    an image was generated but has no way to locate it.
+
+    Only files modified after the run started are considered, so a resumed
+    conversation does not re-report images from its earlier turns.
+    """
+    if not conversation_id:
+        return []
+
+    conv_dir = ANTIGRAVITY_STATE_DIR / "brain" / conversation_id
+    if not conv_dir.is_dir():
+        return []
+
+    found: list[Path] = []
+    try:
+        candidates = sorted(conv_dir.rglob("*"))
+    except OSError as exc:  # pragma: no cover - defensive
+        logger.warning("Could not scan %s for generated images: %s", conv_dir, exc)
+        return []
+
+    for path in candidates:
+        # .system_generated holds transcripts and logs, not deliverables.
+        if ".system_generated" in path.parts:
+            continue
+        if not path.is_file() or path.suffix.lower() not in IMAGE_SUFFIXES:
+            continue
+        try:
+            if path.stat().st_mtime < started_at:
+                continue
+        except OSError:  # pragma: no cover - defensive
+            continue
+        found.append(path)
+
+    if not found or not copy_into_workspace:
+        return found
+
+    delivered: list[Path] = []
+    for path in found:
+        target = workspace / path.name
+        # Never overwrite something already in the caller's workspace.
+        if target.exists():
+            stem, suffix = target.stem, target.suffix
+            target = workspace / f"{stem}_{int(time.time())}{suffix}"
+        try:
+            shutil.copy2(path, target)
+        except OSError as exc:
+            logger.warning("Could not copy %s into the workspace: %s", path, exc)
+            delivered.append(path)
+            continue
+        delivered.append(target)
+    return delivered
+
+
 @dataclass
 class DelegationResult:
     """Everything worth reporting back about one agy run."""
@@ -363,6 +441,8 @@ class DelegationResult:
     # The CLI reports auto-denied permissions as structured data as well as in
     # stderr prose. Preferred for diagnosing a CANCELED run.
     denied_actions: list[dict] | None = None
+    # Images the run generated, after optional delivery into the workspace.
+    generated_images: list[Path] = field(default_factory=list)
 
 
 async def _run_delegation(
@@ -378,6 +458,8 @@ async def _run_delegation(
     effort: str | None = None,
     extra_dirs: list[Path] | None = None,
     json_schema: str | None = None,
+    collect_images: bool = True,
+    deliver_images: bool = True,
 ) -> DelegationResult:
     binary = _find_cli_binary()
     command = _cli_command_prefix(binary) + _build_cli_args(
@@ -395,6 +477,9 @@ async def _run_delegation(
     )
 
     started = time.monotonic()
+    # Wall-clock too: generated images are matched by mtime, which monotonic
+    # time cannot be compared against.
+    started_wall = time.time()
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(workspace),
@@ -444,15 +529,27 @@ async def _run_delegation(
         text = "(agy finished without a response; see status/diagnostics below)"
 
     denied = payload.get("denied_actions")
+    conversation_id = payload.get("conversation_id")
+
+    images: list[Path] = []
+    if collect_images:
+        images = _collect_generated_images(
+            conversation_id,
+            started_wall,
+            workspace,
+            copy_into_workspace=deliver_images,
+        )
+
     return DelegationResult(
         text=text,
         elapsed_seconds=elapsed,
         status=payload.get("status"),
         usage=payload.get("usage"),
         raw_stderr=stderr,
-        conversation_id=payload.get("conversation_id"),
+        conversation_id=conversation_id,
         structured_output=payload.get("structured_output"),
         denied_actions=denied if isinstance(denied, list) and denied else None,
+        generated_images=images,
     )
 
 
@@ -469,6 +566,13 @@ def _format_result(result: DelegationResult, workspace: Path) -> str:
         except (TypeError, ValueError):  # pragma: no cover - defensive
             rendered = repr(result.structured_output)
         lines += ["", "Structured output:", "```json", rendered, "```"]
+
+    if result.generated_images:
+        # The agent's own text frequently omits these, because the turn can end
+        # while the image subagent is still writing. Listing them is the only
+        # reliable way a caller learns what was produced, and where.
+        lines += ["", f"Generated images ({len(result.generated_images)}):"]
+        lines += [f"- `{p}`" for p in result.generated_images]
 
     lines += [
         "",
@@ -578,6 +682,7 @@ async def delegate_to_antigravity(
     effort: str | None = None,
     extra_dirs: list[str] | None = None,
     json_schema: str | None = None,
+    deliver_images: bool = True,
 ) -> str:
     """Delegate a self-contained coding or research task to a Google Antigravity sub-agent.
 
@@ -648,6 +753,15 @@ async def delegate_to_antigravity(
             output", which is more reliable than re-parsing prose. Useful for
             bulk extraction work such as transcription, where you want rows
             rather than a narrative.
+        deliver_images: When the sub-agent generates images, copy them into
+            `directory` and report their paths. Generated images are otherwise
+            written to the CLI's own per-conversation artifact directory under
+            a name it chooses, and the final response often does not say where,
+            because the turn can end while the image subagent is still writing.
+            Set false to leave them in place and report the original paths
+            instead. Forced off under read_only, which must not write to the
+            workspace. Reading or describing an existing image needs no
+            parameter at all.
 
     Returns:
         agy's final answer, the validated object when `json_schema` was used,
@@ -719,6 +833,9 @@ async def delegate_to_antigravity(
             effort=chosen_effort,
             extra_dirs=resolved_extra_dirs,
             json_schema=resolved_schema,
+            # Plan mode promises an unmodified workspace, so images are
+            # reported where they were written rather than copied in.
+            deliver_images=deliver_images and not read_only,
         )
     except ToolError:
         raise
